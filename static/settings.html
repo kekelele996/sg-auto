@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>设置 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
-  <link rel="stylesheet" href="/static/app.css?v=0.4.0">
+  <link rel="stylesheet" href="/static/app.css?v=0.4.1">
 </head>
 <body>
 <div class="shell">
@@ -51,8 +51,8 @@
           <div class="panel">
             <div class="panel-head"><h3>Solo Manager</h3><span id="connectionMeta">未测试</span></div>
             <div class="panel-body grid">
-              <div class="field"><label for="baseUrlInput">服务地址</label><input class="input mono" id="baseUrlInput" placeholder="http://192.168.31.26:8080"></div>
-              <div class="field"><label for="usernameInput">用户名</label><input class="input" id="usernameInput" placeholder="admin" autocomplete="username"></div>
+              <div class="field"><label for="baseUrlInput">服务地址</label><input class="input mono" id="baseUrlInput" placeholder="http://host:port"></div>
+              <div class="field"><label for="usernameInput">用户名</label><input class="input" id="usernameInput" placeholder="Solo Manager 用户名" autocomplete="username"></div>
               <div class="field">
                 <label for="passwordInput">密码</label>
                 <input class="input" id="passwordInput" type="password" placeholder="留空表示不修改" autocomplete="new-password">
@@ -111,7 +111,7 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=0.4.0"></script>
+<script src="/static/app.js?v=0.4.1"></script>
 <script>
   const { $, $$, esc, fetchJson, postJson, fmtClock, fmtDuration, toast,
           initTheme, renderRail, renderMetrics, connectStream, setText, setHtml } = window.SoloApp;
@@ -172,16 +172,26 @@
       const settings = data.settings || {};
       const manager = settings.manager || {};
       $("#baseUrlInput").value = data.platform.managerBaseUrl || manager.baseUrl || "";
-      $("#usernameInput").value = data.platform.username || manager.username || "admin";
+      $("#usernameInput").value = data.platform.username || manager.username || "";
       $("#passwordInput").value = "";
       setText($("#passwordHint"), manager.passwordSaved
         ? "Keychain 中已保存密码；留空表示不修改。"
         : "Keychain 中尚未保存密码；留空表示不修改。");
-      showConnection(data.connection || {});
       if (!state.selectedFolder) state.selectedFolder = settings.defaultFolderId || "";
       renderFolders();
     } catch (error) {
       toast(`读取设置失败：${error.message}`, true);
+    }
+  }
+
+  // The probe logs in against Solo Manager and can take seconds, so it never blocks the form.
+  async function checkConnection() {
+    setText($("#connectionMeta"), "检测中…");
+    try {
+      const data = await fetchJson("/api/settings/connection", {}, 30000);
+      showConnection(data.connection || {});
+    } catch (error) {
+      showConnection({ ok: false, error: error.message });
     }
   }
 
@@ -212,14 +222,7 @@
     }
   });
 
-  $("#testConnectionBtn").addEventListener("click", async () => {
-    try {
-      const data = await fetchJson("/api/settings");
-      showConnection(data.connection || {});
-    } catch (error) {
-      toast(`测试失败：${error.message}`, true);
-    }
-  });
+  $("#testConnectionBtn").addEventListener("click", checkConnection);
 
   $("#saveFolderBtn").addEventListener("click", async () => {
     const picked = $$('input[name="folder"]').find((node) => node.checked);
@@ -409,7 +412,7 @@
   });
 
   fetchJson("/api/snapshot").then(applySnapshot).catch((error) => toast(`初始化失败：${error.message}`, true));
-  loadSettings();
+  loadSettings().then(checkConnection);
   loadFolders().then(() => { if (state.snapshot) renderScope(); });
   loadHealth();
   setInterval(() => { if (!document.hidden) loadHealth(); }, 5000);

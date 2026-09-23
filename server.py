@@ -406,13 +406,16 @@ class Handler(BaseHTTPRequestHandler):
                     "settings": _public(settings),
                     "platform": {
                         "managerBaseUrl": str((self.service.config.get("platform") or {}).get("managerBaseUrl") or ""),
-                        "username": str((self.service.config.get("platform") or {}).get("username") or "admin"),
+                        "username": str((self.service.config.get("platform") or {}).get("username") or ""),
                         "passwordKeychainService": str(
                             (self.service.config.get("platform") or {}).get("passwordKeychainService") or "solo-manager-password"
                         ),
                     },
-                    "connection": self.service.platform.connection_status(),
                 })
+                return
+            if path == "/api/settings/connection":
+                # Logs in against Solo Manager, so it can take seconds; kept off /api/settings.
+                self._json({"connection": self.service.platform.connection_status()})
                 return
             if path == "/api/logs":
                 try:

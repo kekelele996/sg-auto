@@ -146,6 +146,15 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(data["settings"]["manager"]["passwordSaved"], False)
         self.assertNotIn("managerPassword", json.dumps(data["settings"]))
 
+    def test_settings_answer_without_probing_the_manager(self):
+        # The login probe is slow; the settings form must not wait on it.
+        status, data = self._get("/api/settings")
+        self.assertEqual(status, 200)
+        self.assertNotIn("connection", data)
+        status, data = self._get("/api/settings/connection")
+        self.assertEqual(status, 200)
+        self.assertIn("ok", data["connection"])
+
     def test_unknown_folder_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError):
             self._post("/api/settings", {"settings": {"defaultFolderId": "not-a-real-folder"}})

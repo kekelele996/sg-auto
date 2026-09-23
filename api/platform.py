@@ -25,7 +25,6 @@ from typing import Any, Iterable
 
 from .common import (
     DEFAULT_MANAGER_TIMEOUT_SECONDS,
-    DEFAULT_MANAGER_USERNAME,
     DEFAULT_PAGE_SIZE,
     MANAGER_AUTH_STATE_PATH,
     MANAGER_PASSWORD_SERVICE,
@@ -135,7 +134,7 @@ class PlatformProvider:
         return str(
             os.environ.get("SOLO_MANAGER_USERNAME")
             or cfg.get("username")
-            or DEFAULT_MANAGER_USERNAME
+            or ""
         ).strip()
 
     def _manager_password(self) -> str:
@@ -195,6 +194,9 @@ class PlatformProvider:
         return self._remember_issued_token(base_url, issued)
 
     def _login_and_issue_token(self, base_url: str) -> str:
+        username = self._manager_username()
+        if not username:
+            raise MonitorError("未配置 Solo Manager 用户名，请在设置页填写，或设置 SOLO_MANAGER_USERNAME")
         password = self._manager_password()
         if not password:
             raise MonitorError(
@@ -205,7 +207,7 @@ class PlatformProvider:
             base_url,
             "/auth/login",
             method="POST",
-            payload={"username": self._manager_username(), "password": password},
+            payload={"username": username, "password": password},
             timeout=self._manager_timeout(),
         )
         access_token = str((login or {}).get("accessToken") or (login or {}).get("token") or "").strip()

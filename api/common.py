@@ -43,7 +43,6 @@ MANAGER_TOKEN_SERVICE = "solo-manager-token"
 MANAGER_PASSWORD_SERVICE = "solo-manager-password"
 STOP_TASKS_PATH = Path(os.environ.get("SOLOSB_STOP_TASKS_PATH", str(STATE_DIR / "stop-tasks.json")))
 
-DEFAULT_MANAGER_USERNAME = "admin"
 DEFAULT_MANAGER_TIMEOUT_SECONDS = 5
 MANAGER_TOKEN_SCOPES = [
     "project:read",

@@ -271,7 +271,8 @@ GET  /api/tasks/:id/history?side=A&limit=400
 GET  /api/folders                      ChatGPT 应用前 10 个文件夹
 GET  /api/queue                        队列快照
 GET  /api/queue/:itemId/prompt
-GET  /api/settings
+GET  /api/settings                    设置与当前账号（只读本地配置，立即返回）
+GET  /api/settings/connection         登录 Solo Manager 测试连接（可能耗时数秒）
 GET  /api/logs?afterSeq=0&limit=200&level=
 GET  /api/submissions?refresh=0
 GET  /api/platform/projects?taskType=0-1代码生成&refresh=0

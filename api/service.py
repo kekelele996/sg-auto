@@ -1099,7 +1099,10 @@ class SchedulerService:
             raise MonitorError("managerBaseUrl 不能为空")
         platform_cfg = self.config.setdefault("platform", {})
         platform_cfg["managerBaseUrl"] = base
-        platform_cfg["username"] = str(username or "admin").strip() or "admin"
+        user = str(username or "").strip()
+        if not user:
+            raise MonitorError("username 不能为空")
+        platform_cfg["username"] = user
         password_saved = False
         if str(password or "").strip():
             keychain_write(str(platform_cfg.get("passwordKeychainService") or "solo-manager-password"), password.strip())
@@ -1498,7 +1501,7 @@ def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
     manager = clean.get("manager") if isinstance(clean.get("manager"), dict) else {}
     clean["manager"] = {
         "baseUrl": str(manager.get("baseUrl") or ""),
-        "username": str(manager.get("username") or "admin"),
+        "username": str(manager.get("username") or ""),
         "passwordSaved": bool(manager.get("passwordSaved")),
     }
     return clean
