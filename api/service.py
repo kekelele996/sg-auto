@@ -46,6 +46,7 @@ from .common import (
 from .folders import FolderProvider
 from .guard import GUARD_MODES, TaskGuard, guard_settings
 from .housekeeping import Housekeeper
+from .llm_guard import LlmGuard
 from .health import LoopHealth, Watchdog
 from .logs import SchedulerLog
 from .platform import PlatformProvider, SubmissionProvider
@@ -297,6 +298,9 @@ class SchedulerService:
             emit=self.log.emit,
             interval=float(((config.get("monitor") or {}).get("watchdogSeconds")) or 30),
         )
+        self.llm_guard = LlmGuard(self.config, persist=self._persist_config, emit=self.log.emit)
+        self.llm_guard.health = self.health
+        self.queue.llm_guard = self.llm_guard
         self.started_at = time.time()
         self._snapshot_builds = 0
         self.log.emit("service.started", detail=f"pid={os.getpid()} 扫描目录={', '.join(self.queue.active_roots())}")
@@ -435,9 +439,12 @@ class SchedulerService:
         self.health.register("reconcile", self.reconcile.interval_seconds,
                              stall_after=max(600.0, self.reconcile.interval_seconds * 5.0))
         self.health.register("auto-loop", self._auto_interval)
+        self.health.register("llm-guard", 5.0)
         self.hub.start()
         self.reconcile.start()
         self._start_auto_loop()
+        self.llm_guard.start()
+        self.watchdog.supervise("llm-guard", lambda: self.llm_guard._thread, self.llm_guard.start)
         self.watchdog.supervise("snapshot-hub", lambda: self.hub._thread, self.hub.start)
         self.watchdog.supervise("reconcile", lambda: self.reconcile._thread, self.reconcile.start)
         self.watchdog.supervise("auto-loop", lambda: self._auto_thread, self._start_auto_loop)
@@ -456,6 +463,7 @@ class SchedulerService:
         self.watchdog.stop()
         self.hub.stop()
         self.reconcile.stop()
+        self.llm_guard.stop()
         self.log.close()
         self.log.emit("service.stopped", detail="监控台退出")
 
@@ -698,6 +706,7 @@ class SchedulerService:
             return self.queue.fast_snapshot()
         if action == "set-paused":
             paused = bool(payload.get("paused"))
+            self.llm_guard.note_manual_pause()
             self.config.setdefault("automation", {})["paused"] = paused
             self._persist_config()
             self.log.emit("config.paused", detail=f"队列{'已暂停' if paused else '已启动'}")
@@ -707,6 +716,24 @@ class SchedulerService:
             self.config.setdefault("platform", {})["mergeProjectPool"] = enabled
             self._persist_config()
             self.log.emit("config.project_pool", detail=f"包含项目池 → {enabled}")
+            return self.queue.fast_snapshot()
+        if action == "set-llm-guard":
+            enabled = bool(payload.get("enabled"))
+            self.llm_guard.set_enabled(enabled)
+            self.log.emit("config.llm_guard", detail=f"大模型断连自动启停 → {'开启' if enabled else '关闭'}")
+            return self.queue.fast_snapshot()
+        if action == "test-llm":
+            result = self.llm_guard.test()
+            self.log.emit("llm_guard.test", level="info" if result.get("ok") else "warning",
+                          detail=(f"连通 {result.get('latencyMs')}ms" if result.get("ok")
+                                  else f"不通：{result.get('error')}"))
+            # The result is the guard's lastProbe in the snapshot.
+            return self.queue.fast_snapshot()
+        if action == "set-project-reuse":
+            enabled = bool(payload.get("enabled"))
+            self.config.setdefault("automation", {})["projectReuse"] = enabled
+            self._persist_config()
+            self.log.emit("config.project_reuse", detail=f"项目可重用 → {'是' if enabled else '否'}")
             return self.queue.fast_snapshot()
         if action == "set-guard":
             return self._set_guard(payload)

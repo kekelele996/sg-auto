@@ -257,6 +257,46 @@ class ContainerDemandTests(SchedulerTestCase):
         detail = self._usage([item])
         self.assertEqual(detail["estimatedNonTestContainers"], 0)
 
+    def test_task_in_an_unmonitored_folder_still_occupies_capacity(self):
+        """Switching folders must not free the seats of tasks still running."""
+        new_folder = self.root / "elsewhere"
+        new_folder.mkdir(parents=True, exist_ok=True)
+        name = "gb-10-20260920-120000-abc"
+        root_dir = self._task(name, {"status": "candidates_running", "candidates": {
+            "candidate-1": {"status": "running"},
+            "candidate-2": {"status": "running"},
+        }})
+        item = platform_item(status="triggered", capacityHeld=True, taskRoot=str(root_dir),
+                             scopeRoot=str((self.root / "tasks").resolve()), startedAt=utc_now())
+        config = make_config(self.root)
+        config.setdefault("monitor", {})["activeRoots"] = [str(new_folder)]
+        queue = build_queue(config, items=[item], docker=fake_docker(
+            [{"name": f"sologsb-{name}-candidate-1-1790000000-abc", "state": "running"}]))
+        with queue._lock:
+            in_use, detail = queue._capacity_usage_locked(queue._startup_timeout())
+        self.assertEqual(in_use, 1)
+        self.assertEqual(detail["estimatedNonTestContainers"], 2)
+
+    def test_containers_from_other_tools_count_against_the_limit(self):
+        config = make_config(self.root)
+        config["automation"]["excludedProjectCodes"] = ["ld427"]
+        queue = build_queue(config, docker=fake_docker([
+            {"name": "cy180-web-1", "state": "running"},
+            {"name": "friendly_keller", "state": "running"},
+            {"name": "ld427-db", "state": "running"},
+            {"name": "renovation-api", "state": "exited"},
+        ]))
+        with queue._lock:
+            _tasks, detail = queue._capacity_usage_locked(queue._startup_timeout())
+        self.assertEqual(detail["foreignContainers"], ["cy180-web-1", "friendly_keller"])
+        self.assertEqual(detail["nonTestContainerCount"], 2)
+        self.assertEqual(detail["estimatedNonTestContainers"], 2)
+
+    def test_skill_is_told_to_count_every_container(self):
+        queue = build_queue(make_config(self.root))
+        queue.sync_skill_limits()
+        self.assertTrue(json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["countAllContainers"])
+
 
 class PhantomDemandTests(SchedulerTestCase):
     """A candidate stuck at ``running`` without a container must not hold a slot forever.

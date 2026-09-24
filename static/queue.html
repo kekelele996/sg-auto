@@ -106,6 +106,33 @@
             </details>
           </div>
 
+          <div class="panel" id="llmPanel">
+            <div class="panel-head">
+              <h3>大模型断连自动启停</h3>
+              <label class="switch" title="容器调用的大模型连续不可用时自动暂停队列，暂停期间定时复测，恢复后自动启动">
+                <input type="checkbox" id="llmGuardToggle" role="switch"><span class="track"></span><span id="llmGuardText">已关闭</span>
+              </label>
+            </div>
+            <div class="refill-state">
+              <p id="llmState"></p>
+              <p class="hint" id="llmLast"></p>
+            </div>
+            <div class="panel-foot">
+              <button class="btn sm" id="llmTestBtn" type="button">测试容器 API 连通性</button>
+              <span class="hint" id="llmEndpoint"></span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h3>项目可重用</h3>
+              <label class="switch" title="开启：跑完的项目可以再次入队；关闭：进过队列的项目不再入队">
+                <input type="checkbox" id="reuseToggle" role="switch"><span class="track"></span><span id="reuseText">可重用</span>
+              </label>
+            </div>
+            <div class="panel-body"><p class="hint" id="reuseHint"></p></div>
+          </div>
+
           <div class="panel">
             <div class="panel-head"><h3>添加 Solo Manager 项目</h3><span id="platformMeta">读取中…</span></div>
             <div class="panel-tools">
@@ -421,6 +448,8 @@
       ? `容器优先 · 上限 ${queue.maxContainers}`
       : `任务数量优先 · 并发 ${queue.maxTasks}`);
     renderRefill();
+    renderLlmGuard();
+    renderReuse();
     renderGuard();
   }
 
@@ -567,6 +596,91 @@
     } finally {
       state.refillBusy = false;
       renderRefill();
+    }
+  });
+
+  /* -------------------------------------------------------------- llm guard */
+  function renderLlmGuard() {
+    const queue = (state.snapshot || {}).queue || {};
+    const guard = queue.llmGuard || {};
+    const on = Boolean(guard.enabled);
+    const toggle = $("#llmGuardToggle");
+    toggle.disabled = Boolean(state.llmBusy);
+    if (!state.llmBusy) toggle.checked = on;
+    setText($("#llmGuardText"), on ? "已开启" : "已关闭");
+    const probe = guard.lastProbe || {};
+    const next = guard.nextProbeInSeconds;
+    let text;
+    if (!on) text = "已关闭：大模型中断时不会自动暂停队列。";
+    else if (guard.pausedByGuard) {
+      text = `<b>大模型不可用，队列已自动暂停。</b>每 ${esc(Math.round((guard.pausedProbeSeconds || 300) / 60))} 分钟复测一次，恢复后自动启动`
+        + (next != null ? `（约 ${esc(next)} 秒后复测）` : "") + "。";
+    } else if (queue.paused) text = "队列是手动暂停的，守护不会自动启动它；启动队列后恢复监测。";
+    else text = `监测中：每 ${esc(guard.probeSeconds || 60)} 秒探测一次，连续 ${esc(guard.failThreshold || 2)} 次失败自动暂停队列。`;
+    setHtml($("#llmState"), text);
+    const last = $("#llmLast");
+    last.hidden = !probe.at;
+    if (probe.at) {
+      setText(last, probe.ok
+        ? `上次探测 ${fmtClock(probe.at)} · 连通 · ${probe.latencyMs}ms`
+        : `上次探测 ${fmtClock(probe.at)} · 不通 · ${probe.error || "未知错误"}${guard.failures ? ` · 连续失败 ${guard.failures} 次` : ""}`);
+      setAttr(last, "data-tone", probe.ok ? "" : "warn");
+      setAttr(last, "title", probe.error || "");
+    }
+    setText($("#llmEndpoint"), probe.baseUrl ? `${probe.baseUrl} · ${probe.model || ""}` : (queue.anthropicBaseUrl || ""));
+  }
+
+  $("#llmGuardToggle").addEventListener("change", async (event) => {
+    const enabled = event.target.checked;
+    state.llmBusy = true;
+    renderLlmGuard();
+    try {
+      await act("set-llm-guard", { enabled });
+      toast(enabled ? "大模型断连自动启停已开启" : "大模型断连自动启停已关闭");
+    } catch (error) {
+      toast(`切换失败：${error.message}`, true);
+    } finally {
+      state.llmBusy = false;
+      renderLlmGuard();
+    }
+  });
+
+  $("#llmTestBtn").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    setText(button, "测试中…");
+    try {
+      const data = await act("test-llm");
+      const probe = ((data.automation || {}).llmGuard || {}).lastProbe || {};
+      toast(probe.ok ? `连通正常 · ${probe.latencyMs}ms` : `连不通：${probe.error || "未知错误"}`, !probe.ok);
+    } catch (error) {
+      toast(`测试失败：${error.message}`, true);
+    } finally {
+      button.disabled = false;
+      setText(button, "测试容器 API 连通性");
+    }
+  });
+
+  /* ---------------------------------------------------------- project reuse */
+  function renderReuse() {
+    const queue = (state.snapshot || {}).queue || {};
+    const on = queue.projectReuse !== false;
+    const toggle = $("#reuseToggle");
+    if (document.activeElement !== toggle) toggle.checked = on;
+    setText($("#reuseText"), on ? "可重用" : "不可重用");
+    setText($("#reuseHint"), on
+      ? "跑完的项目可以再次入队（手动或自动补队）；同一项目同时只会有一条待启动或运行中的记录。"
+      : "进过队列的项目（含已结束）不会再入队，补队会跳过它们。");
+  }
+
+  $("#reuseToggle").addEventListener("change", async (event) => {
+    const enabled = event.target.checked;
+    try {
+      await act("set-project-reuse", { enabled });
+      toast(enabled ? "项目可重用" : "项目不可重用");
+    } catch (error) {
+      toast(`切换失败：${error.message}`, true);
+      renderReuse();
     }
   });
 

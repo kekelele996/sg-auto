@@ -185,6 +185,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "reconcileSeconds": DEFAULT_RECONCILE_SECONDS,
         "startupGraceSeconds": DEFAULT_STARTUP_GRACE_SECONDS,
         "excludedProjectCodes": [],
+        # A project whose earlier run finished may be queued again (see
+        # QueueManager.tracked_project_codes).
+        "projectReuse": True,
+        # Pause while the containers' LLM is down, resume when it answers
+        # again (api/llm_guard.py).
+        "llmGuard": {
+            "enabled": True,
+            "probeSeconds": 60,
+            "pausedProbeSeconds": 300,
+            "failThreshold": 2,
+            "timeoutSeconds": 30,
+        },
         "maxAttempts": 3,
         "retryBackoffSeconds": DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS,
         "stalledTaskRetrySeconds": DEFAULT_STALLED_TASK_RETRY_SECONDS,

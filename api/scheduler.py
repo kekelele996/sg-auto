@@ -89,7 +89,7 @@ try:  # The worker lives next to the package.
 except Exception:  # pragma: no cover - only hit when running from a stripped copy
     LogWriter = None  # type: ignore[assignment]
 
-from .tasks import discover_task_roots, task_container_names  # noqa: E402  (kept last to avoid a cycle)
+from .tasks import task_container_names  # noqa: E402  (kept last to avoid a cycle)
 from .housekeeping import free_gb, housekeeping_settings  # noqa: E402
 
 CONTAINER_SLOT_ROOT = Path(
@@ -768,6 +768,9 @@ class ContainerLedger:
             "maxContainers": int(max_containers),
             "excludedProjectCodes": sorted({str(code) for code in excluded if str(code).strip()}),
             "managedBy": SKILL_LIMIT_MANAGED_BY,
+            # The limit is machine-wide: the skill counts every running
+            # container, not only its own candidates.
+            "countAllContainers": True,
         }
         if current == wanted:
             return False
@@ -977,6 +980,8 @@ class QueueManager:
         self.refill_status: dict[str, Any] = {"status": "idle", "message": "尚未运行", "at": ""}
         # Last round of the fallback policies (api/guard.py), set by TaskGuard.
         self.guard_status: dict[str, Any] = {}
+        # Set by SchedulerService; its status is shown next to the pause switch.
+        self.llm_guard: Any = None
         # Cleanup totals since start (api/housekeeping.py), set by Housekeeper.
         self.housekeeping_status: dict[str, Any] = {}
         self._disk_low = False
@@ -1465,19 +1470,10 @@ class QueueManager:
         seen = parse_time(item.get("terminalSeenAt"))
         return bool(seen and time.time() - seen.timestamp() >= stability), dirty
 
-    def _job_in_active_roots(self, job: dict[str, Any]) -> bool:
-        if job.get("source") != "platform":
-            return True
-        task_root = JobManager._platform_job_task_root(job)
-        if task_root is None:
-            return True
-        roots = [Path(value) for value in self._active_roots_locked()]
-        if not roots:
-            return False
-        return any(task_root == root or root in task_root.parents for root in roots)
-
     def _queue_reservation_jobs_locked(self) -> list[dict[str, Any]]:
-        active_roots = set(self._active_roots_locked())
+        # Not scoped to the active folders: containers and seats are shared by
+        # the whole machine, so a task left running in a folder that is no
+        # longer monitored still occupies capacity until it finishes.
         reservations: list[dict[str, Any]] = []
         seen: set[str] = set()
         records = [
@@ -1491,8 +1487,6 @@ class QueueManager:
             if not self._item_holds_slot(item):
                 continue
             scope_root = str(item.get("scopeRoot") or "")
-            if scope_root and scope_root not in active_roots:
-                continue
             result_file = Path(str(item.get("resultFile") or ""))
             result = read_json(result_file, {}) if result_file else {}
             if not isinstance(result, dict):
@@ -1501,9 +1495,6 @@ class QueueManager:
             task_root = Path(raw_root).expanduser().resolve() if raw_root else None
             if from_triggered and task_root is None and not scope_root:
                 continue
-            if task_root is not None and active_roots:
-                if not any(task_root == Path(root) or Path(root) in task_root.parents for root in active_roots):
-                    continue
             state_status = self._job_task_status({
                 "taskRoot": str(task_root) if task_root else "",
                 "resultFile": str(result_file) if result_file else "",
@@ -1545,10 +1536,11 @@ class QueueManager:
         }
 
     def _capacity_usage_locked(self, startup_timeout: int) -> tuple[int, dict[str, Any]]:
+        # Every running job counts, whichever folder it lives in; see
+        # _queue_reservation_jobs_locked.
         jobs_by_key = {
             str(job.get("key") or f"job:{index}"): job
             for index, job in enumerate(self.jobs.running())
-            if self._job_in_active_roots(job)
         }
         for reservation in self._queue_reservation_jobs_locked():
             jobs_by_key.setdefault(str(reservation.get("key") or ""), reservation)
@@ -1587,16 +1579,21 @@ class QueueManager:
             return len(active_jobs), detail
 
         group_container_counts: dict[str, int] = {}
+        # Containers started by other tools share the machine-wide limit too.
+        foreign_containers: list[str] = []
         for item in docker.get("items") or []:
             if not isinstance(item, dict) or str(item.get("state") or "").lower() != "running":
                 continue
             group = self._container_group_name(item.get("name"))
             if group:
                 group_container_counts[group] = group_container_counts.get(group, 0) + 1
+            elif str(item.get("name") or "").strip():
+                foreign_containers.append(str(item.get("name")).strip())
         container_groups = sorted(group_container_counts)
         group_set = set(container_groups)
         non_test_groups = [group for group in container_groups if not self._group_is_excluded(group)]
-        non_test_containers = sum(group_container_counts[group] for group in non_test_groups)
+        foreign_containers = sorted(name for name in foreign_containers if not self._group_is_excluded(name))
+        non_test_containers = sum(group_container_counts[group] for group in non_test_groups) + len(foreign_containers)
 
         # Container demand = running containers + what each live task still
         # needs but has not started yet (candidates queued in the skill's
@@ -1679,6 +1676,7 @@ class QueueManager:
             "containerGroups": container_groups,
             "nonTestContainerGroups": non_test_groups,
             "nonTestContainerCount": non_test_containers,
+            "foreignContainers": foreign_containers,
             "pendingContainerDemand": pending_demand,
             "estimatedNonTestContainers": non_test_containers + pending_demand,
             "excludedProjectCodes": sorted(self._excluded_project_codes()),
@@ -1717,59 +1715,39 @@ class QueueManager:
     def container_usage(self) -> dict[str, Any]:
         """Container accounting for the top bar.
 
-        A running ``sologsb-`` container counts only when its group belongs to a
-        task this monitor knows about — a discovered task directory or a queue
-        item's task directory.  Unrelated containers that merely share the
-        ``sologsb-`` prefix no longer inflate the number, which is what the old
-        ``excludedProjectCodes``-only filter got wrong.
+        The numbers are the launch gate's own: every running container on the
+        machine counts against the limit, whichever folder or tool started it,
+        except excluded (test) projects.  Scoping the bar to the monitored
+        folders' tasks made it read "0 / 4" while old-folder tasks and other
+        tools' containers were filling the machine.
         """
         startup_timeout = self._startup_timeout()
         with self._lock:
             _in_use, detail = self._capacity_usage_locked(startup_timeout)
-            known_groups: set[str] = set()
-            for item in self._items:
-                root = str(item.get("taskRoot") or "")
-                if root:
-                    known_groups.add(Path(root).name)
-            for item in self._triggered:
-                root = str(item.get("taskRoot") or "")
-                if root:
-                    known_groups.add(Path(root).name)
-        known_groups |= {
-            Path(root).name
-            for root in discover_task_roots(self._active_roots_locked(), file_cache=self.file_cache)
-        }
 
         docker = self.docker_cache.get() if self.docker_cache else {"items": [], "error": ""}
-        running: list[str] = []
-        attributed = 0
-        excluded = 0
-        for item in docker.get("items") or []:
-            name = str(item.get("name") or "")
-            if not name.startswith("sologsb-") or str(item.get("state") or "").lower() != "running":
-                continue
-            running.append(name)
-            group = self._container_group_name(name)
-            if any(group == known or group.startswith(known + "-") for known in known_groups if known):
-                attributed += 1
-                # Test projects (excludedProjectCodes) run outside the limit in
-                # both the skill's limiter and the launch gate; showing them
-                # against the limit read as "6 / 4".
-                if self._group_is_excluded(group):
-                    excluded += 1
-
+        running_all = sum(
+            1 for item in docker.get("items") or []
+            if str(item.get("name") or "").strip() and str(item.get("state") or "").lower() == "running"
+        )
+        counted = int(detail.get("nonTestContainerCount") or 0)
+        foreign = list(detail.get("foreignContainers") or [])
         slots = self.slots.snapshot()
         hard_limit = self._max_containers_limit()
         # The same numbers the launch gate uses: containers still needed by
         # live tasks (queued candidates, tasks not yet at the race).
         reserved = int(detail.get("pendingContainerDemand") or 0)
         return {
-            "running": attributed,
-            "runningAll": len(running),
-            "excluded": excluded,
-            "counted": attributed - excluded,
+            "running": running_all,
+            "runningAll": running_all,
+            # Test projects run outside the limit in both the skill's limiter
+            # and the launch gate; showing them against it read as "6 / 4".
+            "excluded": max(0, running_all - counted),
+            "counted": counted,
+            "foreign": len(foreign),
+            "foreignNames": foreign,
             "reserved": reserved,
-            "used": attributed - excluded + reserved,
+            "used": counted + reserved,
             "phantom": detail.get("phantomDemand") or [],
             "hardLimit": hard_limit,
             "groups": detail.get("containerGroups") or [],
@@ -1860,6 +1838,8 @@ class QueueManager:
             "capacityInUse": counts["running"],
             "autoRefill": {**public_auto_refill_config(self.config), "lastRun": dict(self.refill_status)},
             "guard": dict(self.guard_status),
+            "llmGuard": self._llm_guard_status(),
+            "projectReuse": self.project_reuse(),
             "disk": self.disk_status(),
             "capacityMode": "fast",
             "containerGroups": [],
@@ -2046,6 +2026,8 @@ class QueueManager:
             "capacityInUse": capacity_in_use,
             "autoRefill": {**public_auto_refill_config(self.config), "lastRun": dict(self.refill_status)},
             "guard": dict(self.guard_status),
+            "llmGuard": self._llm_guard_status(),
+            "projectReuse": self.project_reuse(),
             "disk": self.disk_status(),
             "capacityMode": capacity_detail.get("mode"),
             "containerGroups": capacity_detail.get("containerGroups") or [],
@@ -2121,6 +2103,8 @@ class QueueManager:
                 for item in self._items
             ):
                 raise MonitorError(f"项目 {project_code} 已在队列中或正在运行")
+            if project_code.casefold() in self._used_project_codes_locked():
+                raise MonitorError(f"项目 {project_code} 已跑过，且当前设置为项目不可重用")
             quota_before = project.get("quotaBefore") if isinstance(project.get("quotaBefore"), dict) else {}
             item = {
                 "id": f"platform-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
@@ -2176,18 +2160,47 @@ class QueueManager:
             self._save()
             return copy.deepcopy(item)
 
+    def project_reuse(self) -> bool:
+        """Whether a project whose earlier run finished may be queued again."""
+        return bool(self._automation_cfg().get("projectReuse", True))
+
+    def _llm_guard_status(self) -> dict[str, Any]:
+        if self.llm_guard is None:
+            return {}
+        try:
+            return self.llm_guard.status()
+        except Exception as exc:
+            return {"error": str(exc)}
+
     def pending_count(self) -> int:
         with self._lock:
             return sum(1 for item in self._items if item.get("status") == "pending")
 
     def tracked_project_codes(self) -> set[str]:
+        """Codes that must not be queued again right now.
+
+        Pending and slot-holding items always count.  ``_triggered`` and
+        finished items are history: with ``projectReuse`` on (the default) a
+        finished project may be rerun, with it off every project that ever
+        entered the queue stays excluded.
+        """
         with self._lock:
-            values = list(self._items) + list(self._triggered)
-            return {
+            codes = {
                 str(item.get("projectCode") or "").casefold()
-                for item in values
-                if str(item.get("projectCode") or "").strip()
+                for item in [*self._items, *self._triggered]
+                if (item.get("status") == "pending" or self._item_holds_slot(item))
+                and str(item.get("projectCode") or "").strip()
             }
+            return codes | self._used_project_codes_locked()
+
+    def _used_project_codes_locked(self) -> set[str]:
+        if self.project_reuse():
+            return set()
+        return {
+            str(item.get("projectCode") or "").casefold()
+            for item in [*self._items, *self._triggered]
+            if item.get("source", "platform") == "platform" and str(item.get("projectCode") or "").strip()
+        }
 
     def fail_item(self, item_id: str, error: str) -> bool:
         with self._lock:

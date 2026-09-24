@@ -211,6 +211,7 @@
         s: [
           queued ? `排队候选 ${queued}` : (limit && running >= limit ? "已满" : `空位 ${Math.max(0, limit - running)}`),
           excluded ? `免计 ${excluded}` : "",
+          Number(containers.foreign || 0) ? `外部 ${Number(containers.foreign)}` : "",
           phantom ? `忽略失联 ${phantom}` : "",
         ].filter(Boolean).join(" · "),
         meter: limit ? Math.min(100, Math.round((running / limit) * 100)) : null,
