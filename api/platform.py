@@ -603,11 +603,11 @@ class SubmissionProvider:
                 return json.loads(response.read().decode("utf-8"))
 
         try:
-            raw = get(f"/submissions?page=1&page_size={size}")
+            raw = get(f"/gsb/submissions?page=1&size={size}")
         except (OSError, ValueError, urllib.error.URLError) as exc:
             return {"items": [], "error": f"拉取提交列表失败：{exc}", "source": "keychain"}
         try:
-            stats = get("/submissions/stats")
+            stats = get("/gsb/submissions/stats")
         except Exception:
             stats = None
         items: list[dict[str, Any]] = []
@@ -628,7 +628,7 @@ class SubmissionProvider:
                 "stage": item.get("stage"),
                 "stageLabel": item.get("stage_label"),
                 "repo": item.get("repo_id"),
-                "sessionId": str(item.get("session_id") or "")[:8],
+                "sessionId": str(item.get("a_session_id") or item.get("session_id") or "")[:8],
                 "avg": round(sum(values) / len(values), 2) if values else None,
                 "prompt": item.get("prompt_excerpt") or "",
                 "qc": item.get("qc_summary"),

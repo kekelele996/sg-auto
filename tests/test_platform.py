@@ -1,15 +1,17 @@
 """Tests for the Solo Manager blocklist and candidate filtering."""
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
 from api.common import DEFAULT_CONFIG
-from api.platform import PlatformProvider
+from api.platform import PlatformProvider, SubmissionProvider
 
 
 class BlocklistTests(unittest.TestCase):
@@ -76,6 +78,81 @@ class QuotaMovementTests(unittest.TestCase):
         outcome = provider.release_task("")
         self.assertFalse(outcome["ok"])
         self.assertEqual(outcome["mode"], "local")
+
+
+class SubmissionProviderEndpointTests(unittest.TestCase):
+    def test_direct_fetch_uses_gsb_routes_size_and_a_session_id(self):
+        import api.platform as platform_module
+
+        calls = []
+        responses = iter([
+            {
+                "items": [{
+                    "id": "submission-1",
+                    "a_session_id": "a-session-123456",
+                    "session_id": "legacy-session",
+                    "scores": {"one": 80, "two": 90},
+                }],
+                "meta": {"total": 1},
+            },
+            {"pending": 2, "approved": 8},
+        ])
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, request.get_method(), timeout))
+            return FakeResponse(next(responses))
+
+        config = {
+            "solo2": {
+                "apiBaseUrl": "https://solo2.example/api/v1",
+                "pageSize": 25,
+            },
+        }
+        provider = SubmissionProvider(config)
+        credentials = {
+            "solo2-jzxhnh-cookie": "cookie-value",
+            "solo2-jzxhnh-csrf": "csrf-value",
+        }
+
+        with mock.patch.object(
+            platform_module,
+            "_keychain",
+            side_effect=lambda service: credentials.get(service, ""),
+        ), mock.patch.object(
+            platform_module.urllib.request,
+            "urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = provider._fetch_direct(config["solo2"])
+
+        self.assertEqual(calls, [
+            (
+                "https://solo2.example/api/v1/gsb/submissions?page=1&size=25",
+                "GET",
+                15,
+            ),
+            (
+                "https://solo2.example/api/v1/gsb/submissions/stats",
+                "GET",
+                15,
+            ),
+        ])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["stats"], {"pending": 2, "approved": 8})
+        self.assertEqual(result["items"][0]["sessionId"], "a-sessio")
 
 
 if __name__ == "__main__":
