@@ -293,7 +293,9 @@ class SchedulerService:
         self._stop = threading.Event()
         self._loops: list[threading.Thread] = []
         self._auto_thread: threading.Thread | None = None
+        self._tick_thread: threading.Thread | None = None
         self._auto_interval = 3.0
+        self._tick_interval = 3.0
         self.health = LoopHealth()
         self.reconcile.health = self.health
         self.watchdog = Watchdog(
@@ -446,14 +448,28 @@ class SchedulerService:
         auto_interval = float(((self.config.get("monitor") or {}).get("autoResume") or {}).get("tickSeconds") or 15)
         queue_interval = float((self.config.get("automation") or {}).get("tickSeconds") or 3)
         self._auto_interval = max(1.0, min(auto_interval, queue_interval))
+        # The launch tick runs in its own thread instead of riding along in the
+        # auto loop.  A Manager refill spends minutes in the login Keychain and
+        # in paginated HTTP; while the tick queued behind it, a gate that had
+        # already opened (disk space freed, a container slot released) was only
+        # re-checked once the refill finished, so the queue sat on a stale
+        # "磁盘不足" hold with plenty of free space.
+        self._tick_interval = max(1.0, queue_interval)
         self.health.register("snapshot-hub", self.hub.interval)
         self.health.register("reconcile", self.reconcile.interval_seconds,
                              stall_after=max(600.0, self.reconcile.interval_seconds * 5.0))
-        self.health.register("auto-loop", self._auto_interval)
+        # A refill round visits the Keychain, paginated Manager HTTP and the
+        # project-usage query, so minutes per round are normal under load.  Use
+        # the same tolerance as the reconcile loop; the old 10-tick threshold
+        # had the watchdog call a merely slow refill a stall.
+        self.health.register("auto-loop", self._auto_interval,
+                             stall_after=max(600.0, self._auto_interval * 10))
+        self.health.register("queue-tick", self._tick_interval)
         self.health.register("llm-guard", 5.0)
         self.health.register("project-usage", 5.0, stall_after=600.0)
         self.hub.start()
         self.reconcile.start()
+        self._start_tick_loop()
         self._start_auto_loop()
         self.llm_guard.start()
         self.watchdog.supervise("llm-guard", lambda: self.llm_guard._thread, self.llm_guard.start)
@@ -462,12 +478,20 @@ class SchedulerService:
         self.watchdog.supervise("snapshot-hub", lambda: self.hub._thread, self.hub.start)
         self.watchdog.supervise("reconcile", lambda: self.reconcile._thread, self.reconcile.start)
         self.watchdog.supervise("auto-loop", lambda: self._auto_thread, self._start_auto_loop)
+        self.watchdog.supervise("queue-tick", lambda: self._tick_thread, self._start_tick_loop)
         self.watchdog.start()
 
     def _start_auto_loop(self) -> threading.Thread:
         thread = threading.Thread(target=self._auto_loop, args=(self._auto_interval,), name="auto-loop", daemon=True)
         thread.start()
         self._auto_thread = thread
+        self._loops = [item for item in self._loops if item.is_alive()] + [thread]
+        return thread
+
+    def _start_tick_loop(self) -> threading.Thread:
+        thread = threading.Thread(target=self._tick_loop, args=(self._tick_interval,), name="queue-tick", daemon=True)
+        thread.start()
+        self._tick_thread = thread
         self._loops = [item for item in self._loops if item.is_alive()] + [thread]
         return thread
 
@@ -491,12 +515,32 @@ class SchedulerService:
             finally:
                 self.health.end("auto-loop", "; ".join(errors))
 
+    def _tick_loop(self, interval: float) -> None:
+        while not self._stop.wait(interval):
+            self.health.begin("queue-tick")
+            errors: list[str] = []
+            try:
+                try:
+                    result = self.queue.tick(platform=self.platform)
+                except Exception as exc:
+                    errors.append(f"queue-tick: {exc}")
+                    self.log.emit("loop.queue-tick.failed", level="error", detail=str(exc))
+                else:
+                    if isinstance(result, list) and result:
+                        for action in result:
+                            self.log.emit(
+                                "loop.queue-tick",
+                                detail=_describe_action(action),
+                                taskId=str((action.get("item") or action.get("task") or {}).get("id") or ""),
+                            )
+            finally:
+                self.health.end("queue-tick", "; ".join(errors))
+
     def _auto_iteration(self, errors: list[str]) -> None:
         for label, fn in (
             ("stop-tasks", self.enforce_stop_tasks),
             ("queue-refill", self.maybe_refill_queue),
             ("auto-resume", self.maybe_auto_resume),
-            ("queue-tick", lambda: self.queue.tick(platform=self.platform)),
         ):
             try:
                 result = fn()

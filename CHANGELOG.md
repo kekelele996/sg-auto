@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+### Fixed（启动门禁）
+
+- 启动门禁单独成线程（`queue-tick`，每 `tickSeconds` 复核一次）。此前它和自动补队挤在同一个
+  `auto-loop` 里，而补队要在登录 Keychain 与 Manager 分页 HTTP 上花几分钟，这段时间闸门完全不跑：
+  磁盘已经腾出空间、容器名额也空出来了，队列却还停在「磁盘剩余 29 GB，低于 30 GB：暂停启动」上，
+  看起来像不会自动执行。现在空间/名额一恢复就放行；`/api/health` 与设置页「运行状态」多出一个
+  `queue-tick` 循环。`auto-loop` 只剩下补队等后台活儿，看门狗阈值放宽到 600 秒（与纠错循环一致），
+  免得一轮补队跑得久就被判成卡死、让 keepalive 白重启。
+- 门禁提示只挂在队首：某队列项当过队首后留下的等待文案（例如「磁盘不足」）不再跟着它一直显示，
+  队首换人时旧文案会被清掉。
+
+### Fixed（Docker 探测）
+
+- `docker ps -a` 因宿主机上一个损坏容器整体失败时（`Error response from daemon: rw layer snapshot not
+  found for container …`），改用只列运行中容器的 `docker ps` 重试。此前这种宿主机级故障被读成
+  「Docker 状态未确认」，队列即使磁盘充足、名额空闲也不启动；调度本来也只统计运行中的容器。两次都
+  失败才算 Docker 不可用，并保留 daemon 的报错原文。
+
 ## [0.4.3] - 2026-09-25
 
 ### Added

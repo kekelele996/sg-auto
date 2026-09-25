@@ -192,6 +192,24 @@ class ContainerGateTests(SchedulerTestCase):
         self.assertIn("容器名额已满", str(item.get("containerWait") or ""))
         self.assertEqual(item.get("containerWaitKind"), "capacity")
 
+    def test_gate_message_follows_the_head_only(self):
+        """A leftover wait message must not outlive the gate it described.
+
+        The head is the only item the gate speaks for; a message it left behind
+        when the queue moved on used to keep showing on later items ("磁盘剩余
+        29 GB" long after the space had been freed).
+        """
+        queue = self._queue(self._running(4), maxContainers=4, candidatesPerTask=2)
+        head = platform_item(id="platform-head")
+        tail = platform_item(id="platform-tail", containerWait="磁盘剩余 12 GB，低于 30 GB：暂停启动",
+                             containerWaitKind="gate")
+        queue._items = [head, tail]
+        queue._save()
+        queue.tick()
+        self.assertIn("容器名额已满", str(head.get("containerWait") or ""))
+        self.assertEqual(str(tail.get("containerWait") or ""), "")
+        self.assertEqual(str(tail.get("containerWaitKind") or ""), "")
+
     def test_container_mode_ignores_the_task_cap(self):
         """Tasks past the candidate race hold no container; they must not
         keep the container slots empty just because ``capacity`` is reached."""

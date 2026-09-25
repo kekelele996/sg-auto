@@ -354,6 +354,67 @@ class ManualEnqueueGateTests(unittest.TestCase):
                 self._add("gb-14-1")
 
 
+class BackgroundLoopTests(unittest.TestCase):
+    """The launch tick must not queue behind the slow Manager refill.
+
+    A refill can spend minutes in the Keychain and in paginated Manager HTTP.
+    While it shared the auto loop, a gate that had already opened (disk space
+    freed, a container slot released) was only re-checked once the refill
+    finished, so the queue sat on "磁盘不足" with plenty of free space.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        (self.root / "tasks").mkdir(parents=True, exist_ok=True)
+        self.service = SchedulerService(make_config(self.root))
+        self.addCleanup(self.service.stop)
+
+    def test_tick_keeps_running_while_the_refill_is_blocked(self):
+        service = self.service
+        service._auto_interval = 0.05
+        service._tick_interval = 0.05
+        service.health.register("auto-loop", 0.05)
+        service.health.register("queue-tick", 0.05)
+        refill_started = threading.Event()
+        release_refill = threading.Event()
+        ticks: list[dict] = []
+
+        def blocked_refill():
+            refill_started.set()
+            release_refill.wait(10)
+            return {"status": "blocked"}
+
+        def counting_tick(**kwargs):
+            ticks.append(kwargs)
+            return []
+
+        with mock.patch.object(service, "maybe_refill_queue", side_effect=blocked_refill), \
+                mock.patch.object(service.queue, "tick", side_effect=counting_tick):
+            service._start_tick_loop()
+            service._start_auto_loop()
+            try:
+                self.assertTrue(refill_started.wait(5), "补队没有开始")
+                deadline = time.monotonic() + 5
+                while not ticks and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ticks, "补队卡住时启动门禁没有继续跑")
+            finally:
+                release_refill.set()
+                service._stop.set()
+
+    def test_auto_iteration_no_longer_runs_the_tick(self):
+        service = self.service
+        calls: list[dict] = []
+        with mock.patch.object(service.queue, "tick", side_effect=lambda **kwargs: calls.append(kwargs)), \
+                mock.patch.object(service, "enforce_stop_tasks", return_value=[]), \
+                mock.patch.object(service, "maybe_refill_queue", return_value={"status": "disabled"}), \
+                mock.patch.object(service, "maybe_auto_resume", return_value=[]):
+            service._auto_iteration([])
+        self.assertEqual(calls, [])
+
+
 class LockTests(unittest.TestCase):
     def test_rejects_second_monitor_instance_and_releases_lock(self):
         with tempfile.TemporaryDirectory() as temp:

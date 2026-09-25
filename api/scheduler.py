@@ -3082,15 +3082,26 @@ class QueueManager:
                 or ``gate`` (startup guard, docker, runner, config).
                 """
                 changed = False
+                head = True
                 for pending_item in self._items:
                     if pending_item.get("status") != "pending" or pending_item.get("source") != "platform":
                         continue
-                    if pending_item.get("containerWait") != reason or pending_item.get("containerWaitKind") != kind:
-                        pending_item["containerWait"] = reason
-                        pending_item["containerWaitKind"] = kind
-                        pending_item["error"] = ""
+                    if head:
+                        head = False
+                        if pending_item.get("containerWait") != reason or pending_item.get("containerWaitKind") != kind:
+                            pending_item["containerWait"] = reason
+                            pending_item["containerWaitKind"] = kind
+                            pending_item["error"] = ""
+                            changed = True
+                        continue
+                    # Only the head waits on this gate.  A message left over from
+                    # when another item was the head would misreport the current
+                    # reason ("磁盘剩余 29 GB" long after the space was freed), so
+                    # clear it as soon as the queue moves on.
+                    if pending_item.get("containerWait") or pending_item.get("containerWaitKind"):
+                        pending_item["containerWait"] = ""
+                        pending_item["containerWaitKind"] = ""
                         changed = True
-                    break
                 if changed:
                     self._save()
                 return actions
