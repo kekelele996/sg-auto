@@ -3659,8 +3659,10 @@ class ReconcileLoop:
         out = self._remove_outage_containers(since) + self._requeue_outage_items(since)
         containers = sum(1 for action in out if action["kind"] == "outage-container")
         items = sum(1 for action in out if action["kind"] == "outage-requeued")
+        kept = sum(1 for action in out if action["kind"] == "outage-kept")
         self._emit("llm_guard.recovered", detail=(
             f"断连期间（{iso_from_timestamp(since)} 起）的残留：清理容器 {containers} 个，重新排队 {items} 项"
+            + (f"，{kept} 项仍有存活任务未动" if kept else "")
             if out else f"断连期间（{iso_from_timestamp(since)} 起）没有残留的错误容器或任务"))
         return out
 
@@ -3731,6 +3733,7 @@ class ReconcileLoop:
                         self._emit("llm_guard.item_kept", taskId=item_id,
                                    projectCode=str(item.get("projectCode") or ""),
                                    detail=f"断连期间 orphaned，但 {live_reason}，暂不重新排队")
+                        out.append({"kind": "outage-kept", "itemId": item_id, "reason": live_reason})
                         continue
                     self.queue.slots.release_for_item(item_id)
                 elif status == "failed":

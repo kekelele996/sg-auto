@@ -94,7 +94,7 @@ class GateTests(unittest.TestCase):
         def fail(_config):
             raise RuntimeError("HTTP 401")
 
-        usage = ProjectUsage({"automation": {"projectUsage": {"limit": 1}}}, fetch=fail)
+        usage = ProjectUsage({"automation": {"projectUsage": {"limit": 1}}}, fetch=fail, retry_delay=0)
         status = usage.refresh()
         self.assertIn("401", status["error"])
         self.assertFalse(status["loaded"])
@@ -109,11 +109,43 @@ class GateTests(unittest.TestCase):
                 raise RuntimeError("HTTP 401")
             return {"items": [_submission("o/cy-1-a")]}
 
-        usage = ProjectUsage({"automation": {"projectUsage": {"limit": 1}}}, fetch=fetch)
+        usage = ProjectUsage({"automation": {"projectUsage": {"limit": 1}}}, fetch=fetch, retry_delay=0)
         usage.refresh()
         status = usage.refresh()
         self.assertTrue(status["error"])
         self.assertTrue(usage.blocked_reason("cy-1"))
+
+    def test_a_failed_fetch_is_retried_once(self):
+        calls = {"n": 0}
+
+        def fetch(_config):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("timed out")
+            return {"items": [_submission("o/cy-1-a")]}
+
+        usage = ProjectUsage({}, fetch=fetch, retry_delay=0)
+        failed = []
+        usage.on_failed = failed.append
+        status = usage.refresh()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(status["error"], "")
+        self.assertEqual(failed, [])
+
+    def test_two_failures_ask_for_one_llm_probe_per_streak(self):
+        calls = {"n": 0}
+
+        def fetch(_config):
+            calls["n"] += 1
+            raise RuntimeError("timed out")
+
+        usage = ProjectUsage({}, fetch=fetch, retry_delay=0)
+        failed = []
+        usage.on_failed = failed.append
+        usage.refresh()
+        usage.refresh()
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(failed, ["timed out"])
 
 
 class FetchTests(unittest.TestCase):

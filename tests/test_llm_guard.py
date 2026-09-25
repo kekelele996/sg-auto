@@ -160,6 +160,13 @@ class LlmGuardActionTests(SchedulerTestCase):
         saved = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["automation"]["llmGuard"]["probeSeconds"], 2700)
 
+    def test_recover_action_reports_counts(self):
+        from api.common import MonitorError
+        with self.assertRaises(MonitorError):
+            self.service.automation_action("recover-llm-outage", {"sinceMinutes": 0})
+        snapshot = self.service.automation_action("recover-llm-outage", {"sinceMinutes": 30})
+        self.assertEqual(snapshot["outageRecovery"], {"container": 0, "requeued": 0, "kept": 0})
+
     def test_manual_start_clears_the_guard_pause(self):
         self.config["automation"]["llmGuard"] = {"pausedByGuard": True}
         self.service.automation_action("set-paused", {"paused": False})
@@ -228,3 +235,34 @@ class StatusStabilityTests(SchedulerTestCase):
         clock.now += 7
         self.assertEqual(guard.status(), before)
         self.assertTrue(before["nextProbeAt"])
+
+
+class ProbeRequestTests(SchedulerTestCase):
+    def test_a_requested_probe_runs_now_and_pauses_by_the_threshold(self):
+        config = {"automation": {"paused": False, "llmGuard": {"failThreshold": 2}}}
+        guard, clock, events = _guard(config, [False, False])
+        guard.last_probe_at = clock.now
+        self.assertFalse(guard.due())
+        self.assertTrue(guard.request_probe("质检次数上限检测失败"))
+        self.assertTrue(guard.due())
+        guard.step()
+        self.assertFalse(config["automation"]["paused"])
+        clock.now += 30
+        guard.step()
+        self.assertTrue(config["automation"]["paused"])
+        self.assertTrue(any(event == "llm_guard.probe_requested" for event, _ in events))
+
+    def test_no_probe_is_requested_when_off_or_already_paused(self):
+        guard, _clock, _events = _guard({"automation": {"llmGuard": {"enabled": False}}}, [])
+        self.assertFalse(guard.request_probe("x"))
+        guard, _clock, _events = _guard({"automation": {"llmGuard": {"pausedByGuard": True}}}, [])
+        self.assertFalse(guard.request_probe("x"))
+
+    def test_service_wires_qc_failures_to_the_guard(self):
+        service = SchedulerService(self.config)
+        self.addCleanup(service.stop)
+        requested = []
+        service.llm_guard.request_probe = requested.append
+        service.project_usage.on_failed("timed out")
+        self.assertEqual(requested, ["质检次数上限检测失败"])
+

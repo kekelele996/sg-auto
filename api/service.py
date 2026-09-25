@@ -308,6 +308,8 @@ class SchedulerService:
         self.project_usage = ProjectUsage(self.config, emit=self.log.emit)
         self.project_usage.health = self.health
         self.project_usage.inflight = self.queue.inflight_project_types
+        # A failing QC fetch often means the model is down too.
+        self.project_usage.on_failed = lambda error: self.llm_guard.request_probe("质检次数上限检测失败")
         self.queue.project_usage = self.project_usage
         self.platform.project_usage = self.project_usage
         self.started_at = time.time()
@@ -766,8 +768,13 @@ class SchedulerService:
             minutes = payload.get("sinceMinutes", 120)
             if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not 1 <= minutes <= 1440:
                 raise MonitorError("sinceMinutes 必须在 1 到 1440 之间")
-            self.reconcile.recover_after_outage(time.time() - float(minutes) * 60)
-            return self.queue.fast_snapshot()
+            actions = self.reconcile.recover_after_outage(time.time() - float(minutes) * 60)
+            snapshot = self.queue.fast_snapshot()
+            snapshot["outageRecovery"] = {
+                kind: sum(1 for action in actions if action["kind"] == f"outage-{kind}")
+                for kind in ("container", "requeued", "kept")
+            }
+            return snapshot
         if action == "set-project-reuse":
             enabled = bool(payload.get("enabled"))
             self.config.setdefault("automation", {})["projectReuse"] = enabled

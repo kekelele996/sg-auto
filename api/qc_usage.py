@@ -10,6 +10,11 @@ project's total by default, or to each task type with ``scope: perType``.
 Items still pending or running in our queue count as uses too, since they
 will be submitted.  A refresh thread keeps the counts current; callers only
 read the cache, so nothing on the request path waits on SOLO2.
+
+A failed fetch is retried once right away.  When both attempts fail the
+model behind the containers is often down too, so the first failed refresh
+of a streak asks the LLM guard for one probe (``on_failed``): the guard then
+pauses and resumes the queue by its own settings.
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 100
 NOT_COUNTED_STAGES = {"DISCARDED"}
 SCOPES = {"total", "perType"}
+FETCH_ATTEMPTS = 2
 REPO_CODE = re.compile(r"^([a-z]+)-?(\d+)(?:-|$)", re.IGNORECASE)
 
 DEFAULTS: dict[str, Any] = {
@@ -149,11 +155,15 @@ class ProjectUsage:
         emit: Callable[..., None] | None = None,
         fetch: Callable[[dict[str, Any]], dict[str, Any]] = fetch_submissions,
         clock: Callable[[], float] = time.time,
+        retry_delay: float = 3.0,
     ):
         self.config = config
         self._emit = emit or (lambda *args, **kwargs: None)
         self._fetch = fetch
         self._clock = clock
+        self._retry_delay = retry_delay
+        # Called with the error when a refresh first fails (after the retry).
+        self.on_failed: Callable[[str], Any] | None = None
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
@@ -171,16 +181,29 @@ class ProjectUsage:
     # -- refresh ------------------------------------------------------------ #
     def refresh(self) -> dict[str, Any]:
         with self._refresh_lock:
-            try:
-                fetched = self._fetch(self.config)
-            except Exception as exc:
+            fetched = None
+            error = ""
+            for attempt in range(FETCH_ATTEMPTS):
+                if attempt and self._stop.wait(self._retry_delay):
+                    break
+                try:
+                    fetched = self._fetch(self.config)
+                    break
+                except Exception as exc:
+                    error = str(exc)
+            if fetched is None:
                 with self._lock:
                     first = not self._status.get("error")
-                    self._status = {**self._status, "error": str(exc)[:300], "failedAt": utc_now()}
+                    self._status = {**self._status, "error": error[:300], "failedAt": utc_now()}
                     self._fetched_at = self._clock()
                 if first:
                     self._emit("project_usage.failed", level="warning",
-                               detail=f"质检平台使用次数拉取失败，沿用上次数据：{exc}")
+                               detail=f"质检平台使用次数连续 {FETCH_ATTEMPTS} 次拉取失败，沿用上次数据：{error}")
+                    if self.on_failed is not None:
+                        try:
+                            self.on_failed(error)
+                        except Exception as exc:  # the probe request must not break the refresh
+                            self._emit("project_usage.on_failed_error", level="error", detail=str(exc))
                 return self.status()
             counted = count_submissions(fetched.get("items") or [])
             with self._lock:

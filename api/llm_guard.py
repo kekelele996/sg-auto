@@ -223,6 +223,7 @@ class LlmGuard:
         self.failures = 0
         self.last_probe: dict[str, Any] = {}
         self.last_probe_at = 0.0
+        self.probe_requested = False
         self.last_change = ""
 
     # -- config ------------------------------------------------------------ #
@@ -295,6 +296,20 @@ class LlmGuard:
                 self._cfg().pop("outageSince", None)
             self.failures = 0
 
+    def request_probe(self, reason: str) -> bool:
+        """Probe on the loop's next tick instead of waiting for the interval.
+
+        Used when another check hints at an outage (the QC platform fetch
+        failing): one probe, and pausing still follows ``failThreshold``.
+        Nothing happens when the guard is off or already probing a pause.
+        """
+        settings = self.settings()
+        if not settings["enabled"] or settings["pausedByGuard"]:
+            return False
+        self.probe_requested = True
+        self._emit("llm_guard.probe_requested", detail=f"{reason}，立即检测一次大模型")
+        return True
+
     # -- probing ------------------------------------------------------------ #
     def test(self) -> dict[str, Any]:
         """A one-off probe for the page; also feeds the guard's state."""
@@ -307,6 +322,8 @@ class LlmGuard:
         settings = self.settings()
         if not settings["enabled"]:
             return False
+        if self.probe_requested:
+            return True
         return self._clock() - self.last_probe_at >= self._interval(settings)
 
     def step(self) -> dict[str, Any] | None:
@@ -318,6 +335,7 @@ class LlmGuard:
         # Nothing is launching and the pause is not ours: no need to spend a call.
         if bool(automation.get("paused", True)) and not settings["pausedByGuard"]:
             self.last_probe_at = self._clock()
+            self.probe_requested = False
             return None
         result = self._probe(self._resolve(self.config), settings["timeoutSeconds"])
         self._apply(result, settings)
@@ -335,6 +353,7 @@ class LlmGuard:
         with self._lock:
             self.last_probe = dict(result)
             self.last_probe_at = self._clock()
+            self.probe_requested = False
             automation = self.config.setdefault("automation", {})
             cfg = self._cfg()
             if result.get("ok"):

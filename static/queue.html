@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>任务队列 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
-  <link rel="stylesheet" href="/static/app.css?v=0.4.2">
+  <link rel="stylesheet" href="/static/app.css?v=0.4.3">
   <style>
     /* ---- status strip: one glance answers "is it running, how full, what needs me" */
     .qstrip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
@@ -222,6 +222,8 @@
                   <span id="llmState"></span>
                   <span class="auto-sub" id="llmLast"></span>
                 </div>
+                <button class="btn ghost sm" id="llmRecoverBtn" type="button"
+                        title="删除断连期间候选已放弃的错误容器；断连期间失败、失联或被自动释放的队列项回补额度后重新排队。恢复时会自动执行一次">清理残留</button>
                 <button class="btn ghost sm" id="llmTestBtn" type="button" title="">测试</button>
               </div>
 
@@ -362,7 +364,7 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=0.4.2"></script>
+<script src="/static/app.js?v=0.4.3"></script>
 <script>
   const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtTime, fmtDuration, toast, TASK_STATE_LABELS,
           initTheme, renderRail, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
@@ -899,6 +901,37 @@
     } finally {
       button.disabled = false;
       setText(button, "测试");
+    }
+  });
+
+  $("#llmRecoverBtn").addEventListener("click", async (event) => {
+    const answer = window.prompt(
+      "清理最近多少分钟内大模型断连留下的残留？\n\n"
+      + "· 删除候选已放弃的错误容器（正在跑的当前尝试、已完成的候选不动）\n"
+      + "· 期间失败 / 失联 / 自动释放的队列项回补额度后重新排队（手动释放的不动）", "120");
+    if (answer === null) return;
+    const minutes = Number(answer);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+      toast("请输入 1–1440 之间的整数分钟", true);
+      return;
+    }
+    const button = event.currentTarget;
+    button.disabled = true;
+    setText(button, "清理中…");
+    try {
+      const data = await act("recover-llm-outage", { sinceMinutes: minutes });
+      const done = (data.automation || {}).outageRecovery || {};
+      const parts = [
+        done.container ? `清理容器 ${done.container} 个` : "",
+        done.requeued ? `重新排队 ${done.requeued} 项` : "",
+        done.kept ? `${done.kept} 项仍有存活任务未动` : "",
+      ].filter(Boolean);
+      toast(parts.length ? parts.join(" · ") : `最近 ${minutes} 分钟没有断连残留`);
+    } catch (error) {
+      toast(`清理失败：${error.message}`, true);
+    } finally {
+      button.disabled = false;
+      setText(button, "清理残留");
     }
   });
 
