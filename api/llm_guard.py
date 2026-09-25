@@ -3,7 +3,8 @@
 The candidates inside the containers talk to ``anthropicBaseUrl``; when that
 endpoint drops, every task launched meanwhile burns quota and fails.  The
 guard probes the endpoint with a one-token request.  After ``failThreshold``
-failures in a row it pauses the queue and marks the pause as its own
+failures in a row it pauses the queue — after the first failure it retries
+within ``retrySeconds`` instead of waiting a full interval — and marks the pause as its own
 (``automation.llmGuard.pausedByGuard``), then probes every ``pausedProbeSeconds``
 and resumes only a pause it made itself: a manual pause is never lifted.
 """
@@ -26,6 +27,7 @@ DEFAULT_MODEL = "auto_model/urm"
 
 PROBE_RANGE = (60, 86400)
 PAUSED_PROBE_RANGE = (60, 86400)
+RETRY_RANGE = (10, 3600)
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -33,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
     # concurrent slots, so the healthy-state probe runs only every 30 minutes.
     "probeSeconds": 1800,
     "pausedProbeSeconds": 300,
+    # A failure below the threshold is confirmed or cleared quickly instead of
+    # waiting a whole probeSeconds, so an outage pauses within a minute.
+    "retrySeconds": 30,
     "failThreshold": 2,
     "timeoutSeconds": 30,
 }
@@ -52,6 +57,7 @@ def llm_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(cfg.get("enabled", DEFAULTS["enabled"])),
         "probeSeconds": number("probeSeconds", PROBE_RANGE[0], PROBE_RANGE[1]),
         "pausedProbeSeconds": number("pausedProbeSeconds", PAUSED_PROBE_RANGE[0], PAUSED_PROBE_RANGE[1]),
+        "retrySeconds": number("retrySeconds", RETRY_RANGE[0], RETRY_RANGE[1]),
         "failThreshold": number("failThreshold", 1, 20),
         "timeoutSeconds": number("timeoutSeconds", 5, 120),
         "pausedByGuard": bool(cfg.get("pausedByGuard")),
@@ -209,6 +215,11 @@ class LlmGuard:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.health: Any = None
+        # Called with the outage's start (epoch seconds) after an auto resume,
+        # so the service can clean up what failed while the model was down.
+        self.on_resumed: Callable[[float], Any] | None = None
+        self.last_ok_at = 0.0
+        self.outage_since = 0.0
         self.failures = 0
         self.last_probe: dict[str, Any] = {}
         self.last_probe_at = 0.0
@@ -221,9 +232,16 @@ class LlmGuard:
     def settings(self) -> dict[str, Any]:
         return llm_guard_settings(self.config)
 
+    def _interval(self, settings: dict[str, Any]) -> int:
+        if settings["pausedByGuard"]:
+            return settings["pausedProbeSeconds"]
+        if 0 < self.failures < settings["failThreshold"]:
+            return min(settings["retrySeconds"], settings["probeSeconds"])
+        return settings["probeSeconds"]
+
     def status(self) -> dict[str, Any]:
         settings = self.settings()
-        interval = settings["pausedProbeSeconds"] if settings["pausedByGuard"] else settings["probeSeconds"]
+        interval = self._interval(settings)
         next_at = self.last_probe_at + interval if self.last_probe_at else 0.0
         return {
             **settings,
@@ -244,6 +262,7 @@ class LlmGuard:
             # Turning the guard off hands its pause back to the operator.
             if not enabled:
                 cfg["pausedByGuard"] = False
+                cfg.pop("outageSince", None)
             self.last_probe_at = 0.0
             self._persist()
 
@@ -273,6 +292,7 @@ class LlmGuard:
         with self._lock:
             if self._cfg().get("pausedByGuard"):
                 self._cfg()["pausedByGuard"] = False
+                self._cfg().pop("outageSince", None)
             self.failures = 0
 
     # -- probing ------------------------------------------------------------ #
@@ -287,8 +307,7 @@ class LlmGuard:
         settings = self.settings()
         if not settings["enabled"]:
             return False
-        interval = settings["pausedProbeSeconds"] if settings["pausedByGuard"] else settings["probeSeconds"]
-        return self._clock() - self.last_probe_at >= interval
+        return self._clock() - self.last_probe_at >= self._interval(settings)
 
     def step(self) -> dict[str, Any] | None:
         """Probe if due; pause or resume the queue on a state change."""
@@ -305,6 +324,14 @@ class LlmGuard:
         return result
 
     def _apply(self, result: dict[str, Any], settings: dict[str, Any]) -> None:
+        resumed_since = self._apply_locked(result, settings)
+        if resumed_since is not None and self.on_resumed is not None:
+            try:
+                self.on_resumed(resumed_since)
+            except Exception as exc:  # recovery must never break the probe loop
+                self._emit("llm_guard.recover_failed", level="error", detail=str(exc))
+
+    def _apply_locked(self, result: dict[str, Any], settings: dict[str, Any]) -> float | None:
         with self._lock:
             self.last_probe = dict(result)
             self.last_probe_at = self._clock()
@@ -312,14 +339,24 @@ class LlmGuard:
             cfg = self._cfg()
             if result.get("ok"):
                 self.failures = 0
+                self.last_ok_at = self.last_probe_at
                 if settings["enabled"] and cfg.get("pausedByGuard"):
+                    # Persisted with the pause so a restart mid-outage keeps it.
+                    since = self.outage_since or float(cfg.pop("outageSince", 0) or 0)
+                    cfg.pop("outageSince", None)
                     cfg["pausedByGuard"] = False
                     automation["paused"] = False
                     self.last_change = f"{utc_now()} 大模型恢复，队列自动启动"
                     self._persist()
                     self._emit("llm_guard.resumed", detail=f"大模型可用（{result.get('latencyMs')}ms），队列自动启动")
-                return
+                    # The model went down some time after the last good probe;
+                    # without one (e.g. after a restart) take one full interval.
+                    self.outage_since = 0.0
+                    return since or (self.last_probe_at - settings["probeSeconds"])
+                return None
             self.failures += 1
+            if self.failures == 1:
+                self.outage_since = self.last_ok_at or (self.last_probe_at - settings["probeSeconds"])
             self._emit("llm_guard.probe_failed", level="warning",
                        detail=f"第 {self.failures} 次失败：{result.get('error')}")
             if (
@@ -329,11 +366,13 @@ class LlmGuard:
             ):
                 automation["paused"] = True
                 cfg["pausedByGuard"] = True
+                cfg["outageSince"] = round(self.outage_since, 3)
                 self.last_change = f"{utc_now()} 大模型不可用，队列自动暂停"
                 self._persist()
                 self._emit("llm_guard.paused", level="warning",
                            detail=f"大模型连续 {self.failures} 次不可用，队列自动暂停，"
                                   f"每 {settings['pausedProbeSeconds']} 秒复测：{result.get('error')}")
+            return None
 
     # -- thread ------------------------------------------------------------- #
     def start(self) -> threading.Thread:

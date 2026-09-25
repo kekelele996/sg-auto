@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -3639,6 +3640,119 @@ class ReconcileLoop:
                 self._emit("reconcile.orphan_released", taskId=item_id,
                            projectCode=str(item.get("projectCode") or ""),
                            detail=f"orphaned {int(age)} 秒，自动释放名额")
+        return out
+
+    # -- after an LLM outage ---------------------------------------------- #
+    OUTAGE_TASK_STATES = {"blocked", "failed", "error", "attempt_invalid"}
+
+    def recover_after_outage(self, since: float) -> list[dict[str, Any]]:
+        """Clean up what an LLM outage broke, once the guard sees the model back.
+
+        While the model is down the skill keeps relaunching candidates (each
+        attempt waits out the first-response deadline), new tasks stop at the
+        infrastructure gate, and their queue items end ``failed`` or
+        ``orphaned`` holding a slot for good.  Only work from the outage window
+        (``since`` onwards, epoch seconds) is touched: containers of candidate
+        attempts their task already gave up on are removed, and the queue items
+        are refunded and queued again from scratch.
+        """
+        out = self._remove_outage_containers(since) + self._requeue_outage_items(since)
+        containers = sum(1 for action in out if action["kind"] == "outage-container")
+        items = sum(1 for action in out if action["kind"] == "outage-requeued")
+        self._emit("llm_guard.recovered", detail=(
+            f"断连期间（{iso_from_timestamp(since)} 起）的残留：清理容器 {containers} 个，重新排队 {items} 项"
+            if out else f"断连期间（{iso_from_timestamp(since)} 起）没有残留的错误容器或任务"))
+        return out
+
+    @staticmethod
+    def _docker_created(value: Any) -> float | None:
+        # docker ps prints "2026-09-25 12:44:31 +0800 CST".
+        try:
+            return datetime.strptime(str(value or "")[:25], "%Y-%m-%d %H:%M:%S %z").timestamp()
+        except ValueError:
+            return None
+
+    def _remove_outage_containers(self, since: float) -> list[dict[str, Any]]:
+        if self.queue.docker_cache is None:
+            return []
+        docker = self.queue.docker_cache.get(force=True)
+        with self.queue._lock:
+            roots = {
+                Path(str(item.get("taskRoot") or "")).name: Path(str(item.get("taskRoot") or ""))
+                for item in self.queue._items if str(item.get("taskRoot") or "")
+            }
+        out: list[dict[str, Any]] = []
+        for container in docker.get("items") or []:
+            name = str(container.get("name") or "")
+            if not self.queue._is_candidate_container(container):
+                continue
+            created = self._docker_created(container.get("createdAt"))
+            if created is None or created < since:
+                continue
+            root = roots.get(self.queue._container_group_name(name))
+            state = read_json(root / "monitor" / "state.json", {}) if root else {}
+            state = state if isinstance(state, dict) else {}
+            records = [record for record in (state.get("candidates") or {}).values() if isinstance(record, dict)]
+            owner = next((record for record in records
+                          if str((record.get("container") or {}).get("name") or "") == name), None)
+            if owner is not None and owner.get("status") == "staged":
+                continue
+            if str(container.get("state") or "").lower() == "running":
+                # A running container is only garbage when its task gave up or
+                # its candidate has already moved on to another attempt.
+                stale = owner is not None and owner.get("status") != "running"
+                if not stale and str(state.get("status") or "") not in self.OUTAGE_TASK_STATES:
+                    continue
+            try:
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            out.append({"kind": "outage-container", "container": name})
+            self._emit("llm_guard.container_removed", detail=f"清理断连期间的错误容器 {name}")
+        return out
+
+    def _requeue_outage_items(self, since: float) -> list[dict[str, Any]]:
+        def after(*values: Any) -> bool:
+            stamp = next((parse_time(value) for value in values if parse_time(value)), None)
+            return stamp is not None and stamp.timestamp() >= since
+
+        out: list[dict[str, Any]] = []
+        with self.queue._lock:
+            for item in list(self.queue._items):
+                if item.get("source") != "platform" or item.get("manualReleased"):
+                    continue
+                status = str(item.get("status") or "")
+                item_id = str(item.get("id") or "")
+                if status == "orphaned":
+                    if not after(item.get("orphanedAt"), item.get("triggeredAt"), item.get("startedAt")):
+                        continue
+                    live_reason = self.queue.live_task_reason(item)
+                    if live_reason:
+                        self._emit("llm_guard.item_kept", taskId=item_id,
+                                   projectCode=str(item.get("projectCode") or ""),
+                                   detail=f"断连期间 orphaned，但 {live_reason}，暂不重新排队")
+                        continue
+                    self.queue.slots.release_for_item(item_id)
+                elif status == "failed":
+                    if not after(item.get("finishedAt")):
+                        continue
+                elif status == "skipped" and item.get("autoReleased"):
+                    if not after(item.get("releasedAt")):
+                        continue
+                else:
+                    continue
+                reason = str(item.get("error") or item.get("lastError") or status)
+                if self.platform is not None:
+                    self.queue.refund_quota(item, self.platform, "大模型断连期间失败")
+                item.update({"status": "skipped", "capacityHeld": False, "orphaned": False, "slotMarkers": []})
+                self.queue.retry(item_id)
+                item["notice"] = "大模型断连期间失败，恢复后自动重新排队"
+                item["lastError"] = reason
+                self.queue._save()
+                out.append({"kind": "outage-requeued", "itemId": item_id})
+                self._emit("llm_guard.item_requeued", taskId=item_id,
+                           projectCode=str(item.get("projectCode") or ""),
+                           detail=f"断连期间 {status}（{reason[:80]}），已回补并重新排队")
         return out
 
     def _guard_attempt_inflation(self) -> list[dict[str, Any]]:

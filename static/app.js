@@ -41,7 +41,14 @@
         throw new Error(`响应不是合法 JSON（HTTP ${response.status}）`);
       }
       if (!response.ok || data.error) {
-        throw new Error(data.error || `HTTP ${response.status}`);
+        const message = data.error || `HTTP ${response.status}`;
+        // The pages are read from disk on every request but the Python code
+        // only on start: after a git pull the old process rejects the new
+        // pages' actions until it is restarted.
+        if (/^未知 automation action/.test(message)) {
+          throw new Error(`服务进程还是更新前的旧代码，请重启调度服务后再试（${message}）`);
+        }
+        throw new Error(message);
       }
       return data;
     } catch (error) {

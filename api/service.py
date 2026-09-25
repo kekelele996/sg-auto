@@ -304,6 +304,7 @@ class SchedulerService:
         self.llm_guard = LlmGuard(self.config, persist=self._persist_config, emit=self.log.emit)
         self.llm_guard.health = self.health
         self.queue.llm_guard = self.llm_guard
+        self.llm_guard.on_resumed = self._recover_after_outage
         self.project_usage = ProjectUsage(self.config, emit=self.log.emit)
         self.project_usage.health = self.health
         self.project_usage.inflight = self.queue.inflight_project_types
@@ -759,6 +760,14 @@ class SchedulerService:
                                   else f"不通：{result.get('error')}"))
             # The result is the guard's lastProbe in the snapshot.
             return self.queue.fast_snapshot()
+        if action == "recover-llm-outage":
+            # The same cleanup as an automatic resume, for an outage the guard
+            # did not see (it was off, or the service restarted mid-outage).
+            minutes = payload.get("sinceMinutes", 120)
+            if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not 1 <= minutes <= 1440:
+                raise MonitorError("sinceMinutes 必须在 1 到 1440 之间")
+            self.reconcile.recover_after_outage(time.time() - float(minutes) * 60)
+            return self.queue.fast_snapshot()
         if action == "set-project-reuse":
             enabled = bool(payload.get("enabled"))
             self.config.setdefault("automation", {})["projectReuse"] = enabled
@@ -867,6 +876,12 @@ class SchedulerService:
             self.queue.clear_finished()
             return self.queue.fast_snapshot()
         raise MonitorError(f"未知 automation action: {action}")
+
+    def _recover_after_outage(self, since: float) -> None:
+        # Off the probe thread: removing containers and refunding quota on the
+        # platform can take longer than the guard loop's watchdog allows.
+        threading.Thread(target=self.reconcile.recover_after_outage, args=(since,),
+                         name="llm-outage-recovery", daemon=True).start()
 
     def _persist_config(self) -> None:
         from .common import CONFIG_PATH, save_config

@@ -768,6 +768,67 @@ class ReconcileTests(SchedulerTestCase):
         self.assertIn("桌面任务仍处于", str(item.get("notice") or ""))
 
 
+class OutageRecoveryTests(SchedulerTestCase):
+    """After the LLM guard resumes, what failed during the outage is cleaned up."""
+
+    SINCE = time.time() - 600
+
+    def _stamp(self, offset):
+        return iso_from_timestamp(self.SINCE + offset)
+
+    def test_items_from_the_outage_window_are_requeued(self):
+        items = [
+            platform_item(id="in-window", status="failed", finishedAt=self._stamp(60), error="首响应超时",
+                          runKey="old"),
+            platform_item(id="before", status="failed", finishedAt=self._stamp(-60), error="旧失败"),
+            platform_item(id="orphan", status="orphaned", orphaned=True, capacityHeld=True,
+                          orphanedAt=self._stamp(120), startedAt=self._stamp(100)),
+            platform_item(id="manual", status="skipped", manualReleased=True, releasedAt=self._stamp(60)),
+        ]
+        queue = build_queue(self.config, items=items)
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        actions = loop.recover_after_outage(self.SINCE)
+        by_id = {item["id"]: item for item in queue._items}
+        self.assertEqual({a["itemId"] for a in actions if a["kind"] == "outage-requeued"}, {"in-window", "orphan"})
+        self.assertEqual(by_id["in-window"]["status"], "pending")
+        self.assertNotEqual(by_id["in-window"]["runKey"], "old")
+        self.assertEqual(by_id["in-window"]["lastError"], "首响应超时")
+        self.assertFalse(by_id["orphan"]["capacityHeld"])
+        self.assertEqual(by_id["before"]["status"], "failed")
+        self.assertEqual(by_id["manual"]["status"], "skipped")
+
+    def test_only_given_up_candidate_containers_are_removed(self):
+        task_root = self.root / "tasks" / "gb-7-20260925-120000-abc"
+        (task_root / "monitor").mkdir(parents=True)
+        prefix = "sologsb-gb-7-20260925-120000-abc-candidate-"
+        (task_root / "monitor" / "state.json").write_text(json.dumps({
+            "status": "candidates_running",
+            "candidates": {
+                "candidate-1": {"status": "attempt_invalid", "container": {"name": prefix + "1-1-old"}},
+                "candidate-2": {"status": "running"},
+                "candidate-3": {"status": "staged", "container": {"name": prefix + "3-1-won"}},
+            },
+        }), encoding="utf-8")
+        created = time.strftime("%Y-%m-%d %H:%M:%S +0000 UTC", time.gmtime(self.SINCE + 60))
+        old = time.strftime("%Y-%m-%d %H:%M:%S +0000 UTC", time.gmtime(self.SINCE - 60))
+        docker = fake_docker([
+            {"name": prefix + "1-1-old", "state": "running", "createdAt": created},   # attempt given up
+            {"name": prefix + "2-2-new", "state": "running", "createdAt": created},   # current attempt
+            {"name": prefix + "3-1-won", "state": "exited", "createdAt": created},    # staged result
+            {"name": prefix + "2-1-dead", "state": "exited", "createdAt": created},   # failed attempt
+            {"name": prefix + "2-0-older", "state": "exited", "createdAt": old},      # before the outage
+            {"name": "gb-7-db", "state": "exited", "createdAt": created},             # not a candidate
+        ])
+        queue = build_queue(self.config, items=[platform_item(status="triggered", taskRoot=str(task_root))],
+                            docker=docker)
+        loop = ReconcileLoop(queue, queue.jobs, log=None, platform=None)
+        with mock.patch("api.scheduler.subprocess.run") as run:
+            actions = loop.recover_after_outage(self.SINCE)
+        removed = {call.args[0][-1] for call in run.call_args_list}
+        self.assertEqual(removed, {prefix + "1-1-old", prefix + "2-1-dead"})
+        self.assertEqual(len([a for a in actions if a["kind"] == "outage-container"]), 2)
+
+
 class SlotLifecycleTests(SchedulerTestCase):
     """A claimed task takes slots, and gives them back when its containers appear."""
 

@@ -61,6 +61,34 @@ class LlmGuardTests(SchedulerTestCase):
         self.assertEqual([name for name, _ in events if name in {"llm_guard.paused", "llm_guard.resumed"}],
                          ["llm_guard.paused", "llm_guard.resumed"])
 
+    def test_a_first_failure_is_retried_quickly(self):
+        self.config["automation"]["paused"] = False
+        guard, clock, _events = _guard(self.config, [True, False, False])
+        guard.step()
+        clock.now += 1800
+        guard.step()
+        self.assertEqual(guard.failures, 1)
+        self.assertFalse(self.config["automation"]["paused"])
+        clock.now += 29
+        self.assertIsNone(guard.step())
+        clock.now += 1
+        guard.step()
+        self.assertTrue(self.config["automation"]["paused"])
+
+    def test_resume_reports_when_the_outage_began(self):
+        self.config["automation"]["paused"] = False
+        guard, clock, _events = _guard(self.config, [True, False, False, True])
+        seen = []
+        guard.on_resumed = seen.append
+        guard.step()
+        good = clock.now
+        for step in (1800, 30, 300):
+            clock.now += step
+            guard.step()
+        self.assertFalse(self.config["automation"]["paused"])
+        self.assertEqual(seen, [good])
+        self.assertNotIn("outageSince", self.config["automation"]["llmGuard"])
+
     def test_default_probe_interval_is_thirty_minutes(self):
         guard, _clock, _events = _guard({"automation": {}}, [])
         self.assertEqual(guard.settings()["probeSeconds"], 1800)

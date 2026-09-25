@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>任务队列 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
-  <link rel="stylesheet" href="/static/app.css?v=0.4.1">
+  <link rel="stylesheet" href="/static/app.css?v=0.4.2">
   <style>
     /* ---- status strip: one glance answers "is it running, how full, what needs me" */
     .qstrip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
@@ -362,9 +362,9 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=0.4.1"></script>
+<script src="/static/app.js?v=0.4.2"></script>
 <script>
-  const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtDuration, toast, TASK_STATE_LABELS,
+  const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtTime, fmtDuration, toast, TASK_STATE_LABELS,
           initTheme, renderRail, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
 
   // ``phase`` is computed by the server from the item, its state.json and
@@ -835,6 +835,7 @@
     if (!on) text = "已关闭：大模型中断时不会自动暂停";
     else if (guard.pausedByGuard) text = "不可用，已自动暂停；恢复后自动启动";
     else if (queue.paused) text = "队列为手动暂停，启动后恢复监测";
+    else if (Number(guard.failures || 0) > 0) text = `第 ${guard.failures} 次失败，${guard.retrySeconds || 30} 秒后复测${guard.nextProbeAt ? `（${fmtTime(guard.nextProbeAt)}）` : ""}`;
     else text = `连续 ${guard.failThreshold || 2} 次失败自动暂停${guard.nextProbeAt ? ` · 下次 ${fmtClock(guard.nextProbeAt)}` : ""}`;
     setText($("#llmState"), text);
     const minutes = (value, fallback) => String(Math.max(1, Math.round((value || fallback) / 60)));
