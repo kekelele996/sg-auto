@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
@@ -95,6 +97,45 @@ class DiscoveryTests(SchedulerTestCase):
 
     def test_missing_root_is_ignored(self):
         self.assertEqual(discover_task_roots([self.root / "nope"]), [])
+
+
+class DockerListingFallbackTests(unittest.TestCase):
+    """One corrupted container must not blind the whole scheduler.
+
+    ``docker ps -a`` fails as a single command ("rw layer snapshot not found for
+    container ...") when any container on the host is broken.  Reading that as
+    "Docker unavailable" stopped every launch even though the daemon and the
+    running containers were fine.
+    """
+
+    @staticmethod
+    def _completed(code: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["docker", "ps"], code, stdout, stderr)
+
+    def test_broken_full_listing_falls_back_to_running_containers(self):
+        broken = self._completed(1, "", "Error response from daemon: rw layer snapshot not found for container abc")
+        running = self._completed(0, json.dumps({"ID": "1", "Names": "cand-1", "State": "running", "Status": "Up"}) + "\n")
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            return broken if "-a" in args else running
+
+        with mock.patch("api.tasks.subprocess.run", side_effect=fake_run):
+            data = DockerCache(ttl=0).get()
+
+        self.assertEqual(data.get("error"), "")
+        self.assertTrue(data.get("fetchedOk"))
+        self.assertEqual([item["name"] for item in data["items"]], ["cand-1"])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("-a", calls[1])
+
+    def test_two_broken_listings_still_report_docker_unavailable(self):
+        broken = self._completed(1, "", "Error response from daemon: rw layer snapshot not found for container abc")
+        with mock.patch("api.tasks.subprocess.run", return_value=broken):
+            data = DockerCache(ttl=0).get()
+        self.assertIn("rw layer snapshot not found", str(data.get("error") or ""))
+        self.assertFalse(data.get("fetchedOk"))
 
 
 class SnapshotTests(SchedulerTestCase):

@@ -470,19 +470,35 @@ class DockerCache:
         except (TypeError, ValueError):
             return {}
 
-    def _fetch(self) -> dict[str, Any]:
+    @staticmethod
+    def _ps(*scope: str) -> subprocess.CompletedProcess | str:
+        """Run ``docker ps``; return the failure text instead of raising."""
         try:
-            result = subprocess.run(
-                ["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"],
+            return subprocess.run(
+                ["docker", "ps", *scope, "--no-trunc", "--format", "{{json .}}"],
                 capture_output=True,
                 text=True,
                 timeout=8,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return {"items": [], "byName": {}, "error": f"Docker 不可用：{exc}"}
+            return f"Docker 不可用：{exc}"
+
+    def _fetch(self) -> dict[str, Any]:
+        result = self._ps("-a")
+        if isinstance(result, str):
+            return {"items": [], "byName": {}, "error": result}
         if result.returncode != 0:
-            return {"items": [], "byName": {}, "error": (result.stderr or "docker ps 失败").strip()}
+            # A single corrupted container fails the whole ``docker ps -a`` run
+            # ("rw layer snapshot not found for container ...").  That reads as
+            # "Docker unavailable" and blocks every launch even though the
+            # daemon and the running containers are fine.  The scheduler only
+            # accounts running containers, so fall back to the running-only
+            # listing; only when that fails too is Docker really unusable.
+            fallback = self._ps()
+            if isinstance(fallback, str) or fallback.returncode != 0:
+                return {"items": [], "byName": {}, "error": (result.stderr or "docker ps 失败").strip()}
+            result = fallback
         items: list[dict[str, Any]] = []
         by_name: dict[str, dict[str, Any]] = {}
         for line in result.stdout.splitlines():
