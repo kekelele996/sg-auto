@@ -401,9 +401,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"itemId": item_id, "prompt": self.service.queue.item_prompt(item_id)})
                 return
             if path == "/api/settings":
-                settings = self.service.settings.get() if self.service.settings else {}
                 self._json({
-                    "settings": _public(settings),
+                    "settings": self.service.public_settings(),
                     "platform": {
                         "managerBaseUrl": str((self.service.config.get("platform") or {}).get("managerBaseUrl") or ""),
                         "username": str((self.service.config.get("platform") or {}).get("username") or ""),
@@ -495,7 +494,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        if path not in {"/api/action", "/api/automation", "/api/settings", "/api/settings/manager"}:
+        if path not in {"/api/action", "/api/automation", "/api/settings", "/api/settings/manager",
+                        "/api/settings/manager/test"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         if not self._remote_actions_allowed():
@@ -531,6 +531,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 patch = payload.get("settings") if isinstance(payload.get("settings"), dict) else payload
                 self._json({"ok": True, "settings": self.service.update_settings(patch)})
+                return
+            if path == "/api/settings/manager/test":
+                self._json({"ok": True, "connection": self.service.test_manager_login(
+                    base_url=str(payload.get("managerBaseUrl") or ""),
+                    username=str(payload.get("username") or ""),
+                    password=str(payload.get("password") or ""),
+                )})
                 return
             if path == "/api/settings/manager":
                 self._json(self.service.save_manager_credentials(

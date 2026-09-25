@@ -40,6 +40,8 @@ from .common import (
     clamp_int,
     deep_merge,
     read_json,
+    keychain_read,
+    redact_text,
     render_auto_trigger_prompt,
     utc_now,
 )
@@ -47,6 +49,7 @@ from .folders import FolderProvider
 from .guard import GUARD_MODES, TaskGuard, guard_settings
 from .housekeeping import Housekeeper
 from .llm_guard import LlmGuard
+from .qc_usage import ProjectUsage, project_usage_settings
 from .health import LoopHealth, Watchdog
 from .logs import SchedulerLog
 from .platform import PlatformProvider, SubmissionProvider
@@ -301,6 +304,11 @@ class SchedulerService:
         self.llm_guard = LlmGuard(self.config, persist=self._persist_config, emit=self.log.emit)
         self.llm_guard.health = self.health
         self.queue.llm_guard = self.llm_guard
+        self.project_usage = ProjectUsage(self.config, emit=self.log.emit)
+        self.project_usage.health = self.health
+        self.project_usage.inflight = self.queue.inflight_project_types
+        self.queue.project_usage = self.project_usage
+        self.platform.project_usage = self.project_usage
         self.started_at = time.time()
         self._snapshot_builds = 0
         self.log.emit("service.started", detail=f"pid={os.getpid()} 扫描目录={', '.join(self.queue.active_roots())}")
@@ -440,11 +448,14 @@ class SchedulerService:
                              stall_after=max(600.0, self.reconcile.interval_seconds * 5.0))
         self.health.register("auto-loop", self._auto_interval)
         self.health.register("llm-guard", 5.0)
+        self.health.register("project-usage", 5.0, stall_after=600.0)
         self.hub.start()
         self.reconcile.start()
         self._start_auto_loop()
         self.llm_guard.start()
         self.watchdog.supervise("llm-guard", lambda: self.llm_guard._thread, self.llm_guard.start)
+        self.project_usage.start()
+        self.watchdog.supervise("project-usage", lambda: self.project_usage._thread, self.project_usage.start)
         self.watchdog.supervise("snapshot-hub", lambda: self.hub._thread, self.hub.start)
         self.watchdog.supervise("reconcile", lambda: self.reconcile._thread, self.reconcile.start)
         self.watchdog.supervise("auto-loop", lambda: self._auto_thread, self._start_auto_loop)
@@ -464,6 +475,7 @@ class SchedulerService:
         self.hub.stop()
         self.reconcile.stop()
         self.llm_guard.stop()
+        self.project_usage.stop()
         self.log.close()
         self.log.emit("service.stopped", detail="监控台退出")
 
@@ -722,6 +734,24 @@ class SchedulerService:
             self.llm_guard.set_enabled(enabled)
             self.log.emit("config.llm_guard", detail=f"大模型断连自动启停 → {'开启' if enabled else '关闭'}")
             return self.queue.fast_snapshot()
+        if action == "set-llm-guard-interval":
+            seconds = {}
+            for key, label in (("probeMinutes", "探测间隔"), ("pausedProbeMinutes", "暂停后复测间隔")):
+                value = payload.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    minutes = float(value)
+                except (TypeError, ValueError):
+                    raise MonitorError(f"{label}必须是数字（分钟）") from None
+                if not 1 <= minutes <= 1440:
+                    raise MonitorError(f"{label}必须在 1 到 1440 分钟之间")
+                seconds[key] = round(minutes * 60)
+            settings = self.llm_guard.set_intervals(seconds.get("probeMinutes"), seconds.get("pausedProbeMinutes"))
+            self.log.emit("config.llm_guard", detail=(
+                f"大模型探测间隔 → 每 {settings['probeSeconds'] // 60} 分钟；"
+                f"暂停后每 {settings['pausedProbeSeconds'] // 60} 分钟复测"))
+            return self.queue.fast_snapshot()
         if action == "test-llm":
             result = self.llm_guard.test()
             self.log.emit("llm_guard.test", level="info" if result.get("ok") else "warning",
@@ -734,6 +764,13 @@ class SchedulerService:
             self.config.setdefault("automation", {})["projectReuse"] = enabled
             self._persist_config()
             self.log.emit("config.project_reuse", detail=f"项目可重用 → {'是' if enabled else '否'}")
+            return self.queue.fast_snapshot()
+        if action == "set-project-usage":
+            return self._set_project_usage(payload)
+        if action == "refresh-project-usage":
+            status = self.project_usage.refresh()
+            self.log.emit("project_usage.refresh", level="warning" if status.get("error") else "info",
+                          detail=status.get("error") or f"质检平台已计入 {status.get('counted', 0)} 次提交")
             return self.queue.fast_snapshot()
         if action == "set-guard":
             return self._set_guard(payload)
@@ -787,6 +824,7 @@ class SchedulerService:
                 max_containers=self.queue._max_containers_limit(),
                 candidates_per_task=self.queue._candidates_per_task(),
                 schedule_mode=self.queue._schedule_mode(),
+                manager_username=self._manager_username(),
             )
             item = self.queue.add_platform(
                 project,
@@ -896,12 +934,38 @@ class SchedulerService:
                 max_containers=self.queue._max_containers_limit(),
                 candidates_per_task=self.queue._candidates_per_task(),
                 schedule_mode=self.queue._schedule_mode(),
+                manager_username=self._manager_username(),
             )
             if item.get("triggerPrompt") != prompt:
                 item["triggerPrompt"] = prompt
                 changed = True
         if changed:
             self.queue._save()
+
+    def _set_project_usage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cfg = self.config.setdefault("automation", {}).setdefault("projectUsage", {})
+        if "enabled" in payload:
+            cfg["enabled"] = bool(payload.get("enabled"))
+        if "limit" in payload:
+            try:
+                limit = int(payload.get("limit"))
+            except (TypeError, ValueError):
+                raise MonitorError("使用次数上限必须是整数")
+            if not 1 <= limit <= 1000:
+                raise MonitorError("使用次数上限需在 1-1000 之间")
+            cfg["limit"] = limit
+        if "scope" in payload:
+            scope = str(payload.get("scope") or "")
+            if scope not in {"total", "perType"}:
+                raise MonitorError("统计口径只能是 total 或 perType")
+            cfg["scope"] = scope
+        self._persist_config()
+        settings = project_usage_settings(self.config)
+        scope_text = "按项目合计" if settings["scope"] == "total" else "按任务类型分别"
+        self.log.emit("config.project_usage",
+                      detail=f"质检使用次数限制 → {'开启' if settings['enabled'] else '关闭'}，"
+                             f"上限 {settings['limit']}，{scope_text}")
+        return self.queue.fast_snapshot()
 
     def _set_auto_refill(self, enabled: bool) -> dict[str, Any]:
         with self._queue_refill_lock:
@@ -1118,33 +1182,96 @@ class SchedulerService:
         return _public_settings(merged)
 
     def save_manager_credentials(self, *, base_url: str, username: str, password: str) -> dict[str, Any]:
-        """Persist the Solo Manager connection; the password goes to Keychain only."""
+        """Verify a real login, then persist; the password goes to Keychain only.
+
+        A new password is saved only once it logs in as ``username``, so a
+        typo never replaces a working one.  After a successful login a
+        durable token is issued for that user, replacing any token that
+        belonged to someone else.
+        """
         from .common import keychain_write
 
         base = str(base_url or "").strip().rstrip("/")
         if not base:
             raise MonitorError("managerBaseUrl 不能为空")
-        platform_cfg = self.config.setdefault("platform", {})
-        platform_cfg["managerBaseUrl"] = base
         user = str(username or "").strip()
         if not user:
             raise MonitorError("username 不能为空")
+        secret = str(password or "").strip()
+        platform_cfg = self.config.setdefault("platform", {})
+        service = str(platform_cfg.get("passwordKeychainService") or "solo-manager-password")
+        login_error = ""
+        login: dict[str, Any] = {}
+        try:
+            login = self.platform.verify_login(base, user, secret)
+        except Exception as exc:
+            login_error = redact_text(str(exc), 300)
+        if secret and login_error:
+            # Nothing is changed when the new password does not log in.
+            self.log.emit("settings.manager", level="warning", detail=f"Solo Manager 登录验证失败，未保存：{login_error}")
+            raise MonitorError(f"登录验证失败，未保存：{login_error}")
+        user_changed = str(platform_cfg.get("username") or "") != user
+        platform_cfg["managerBaseUrl"] = base
         platform_cfg["username"] = user
-        password_saved = False
-        if str(password or "").strip():
-            keychain_write(str(platform_cfg.get("passwordKeychainService") or "solo-manager-password"), password.strip())
-            password_saved = True
+        if secret:
+            keychain_write(service, secret)
         self._persist_config()
+        token_warning = ""
+        if login:
+            try:
+                self.platform._issue_durable_token(login["baseUrl"], login["accessToken"])
+            except Exception as exc:
+                token_warning = f"登录成功但换发令牌失败：{redact_text(str(exc), 200)}"
+        if user_changed:
+            self._sync_pending_prompts(str(self.config.get("automation", {}).get("promptTemplate") or ""))
+        password_saved = bool(keychain_read(service))
         if self.settings is not None:
             self.settings.update({"managerPasswordSaved": password_saved})
-        self.log.emit("settings.manager", detail=f"Solo Manager → {base}（密码{'已保存' if password_saved else '未改动'}）")
+        self.log.emit(
+            "settings.manager",
+            level="info" if login else "warning",
+            detail=(f"Solo Manager → {base}，用户 {user}，密码{'已更新' if secret else '未改动'}，"
+                    f"登录{'成功' if login else '失败：' + login_error}"),
+        )
         status = self.platform.connection_status()
+        if token_warning:
+            status["warning"] = "；".join(part for part in (status.get("warning"), token_warning) if part)
         return {
             "ok": True,
             "passwordSaved": password_saved,
             "connection": status,
-            "settings": _public_settings(self.settings.get() if self.settings is not None else {}),
+            "settings": self.public_settings(),
         }
+
+    def _manager_username(self) -> str:
+        """The Manager user the prompt names; same precedence as the platform's login."""
+        return str(os.environ.get("SOLO_MANAGER_USERNAME")
+                   or (self.config.get("platform") or {}).get("username") or "").strip()
+
+    def test_manager_login(self, *, base_url: str, username: str, password: str) -> dict[str, Any]:
+        """Log in with the form's values (blank = saved ones) without saving anything."""
+        try:
+            login = self.platform.verify_login(base_url, username, password)
+        except Exception as exc:
+            return {"ok": False, "username": str(username or self._manager_username()),
+                    "login": {"ok": False, "error": redact_text(str(exc), 300)},
+                    "error": f"密码登录失败：{redact_text(str(exc), 300)}", "checkedAt": utc_now()}
+        return {"ok": True, "baseUrl": login["baseUrl"], "username": login["username"],
+                "login": {"ok": True, "role": login["role"]}, "checkedAt": utc_now()}
+
+    def public_settings(self) -> dict[str, Any]:
+        platform_cfg = self.config.get("platform") or {}
+        service = str(platform_cfg.get("passwordKeychainService") or "solo-manager-password")
+        clean = _public_settings(self.settings.get() if self.settings is not None else {})
+        clean["manager"] = {
+            "baseUrl": str(platform_cfg.get("managerBaseUrl") or clean["manager"]["baseUrl"]),
+            "username": str(platform_cfg.get("username") or clean["manager"]["username"]),
+            "passwordSaved": bool(keychain_read(service)),
+        }
+        saved = clean["manager"]["passwordSaved"]
+        if self.settings is not None and bool(self.settings.get().get("managerPasswordSaved")) != saved:
+            self.settings.update({"managerPasswordSaved": saved})
+        return clean
 
     # -- background jobs -------------------------------------------------- #
     def enforce_stop_tasks(self) -> list[dict[str, Any]]:
@@ -1375,6 +1502,7 @@ class SchedulerService:
                     max_containers=self.queue._max_containers_limit(),
                     candidates_per_task=self.queue._candidates_per_task(),
                     schedule_mode=self.queue._schedule_mode(),
+                    manager_username=self._manager_username(),
                 )
                 try:
                     self.queue.add_platform(
@@ -1520,15 +1648,14 @@ def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """Settings as the UI may see them — never any credential material."""
     clean = copy.deepcopy(settings or {})
     clean.setdefault("disabledProjects", [])
+    saved_flag = bool(clean.get("managerPasswordSaved"))
     for key in list(clean):
         if any(marker in key.lower() for marker in ("password", "secret", "token")):
-            if key == "managerPasswordSaved":
-                continue
             clean.pop(key, None)
     manager = clean.get("manager") if isinstance(clean.get("manager"), dict) else {}
     clean["manager"] = {
         "baseUrl": str(manager.get("baseUrl") or ""),
         "username": str(manager.get("username") or ""),
-        "passwordSaved": bool(manager.get("passwordSaved")),
+        "passwordSaved": bool(manager.get("passwordSaved") or saved_flag),
     }
     return clean

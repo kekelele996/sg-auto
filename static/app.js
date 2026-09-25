@@ -141,11 +141,11 @@
     const mode = queue.scheduleMode || "containers";
     const badge = $("#modeBadge");
     if (badge) {
-      badge.dataset.mode = mode;
-      badge.innerHTML = `<span class="dot"></span>${mode === "containers" ? "容器优先" : "任务数量优先"}`;
-      badge.title = mode === "containers"
+      setAttr(badge, "data-mode", mode);
+      setHtml(badge, `<span class="dot"></span>${mode === "containers" ? "容器优先" : "任务数量优先"}`);
+      setAttr(badge, "title", mode === "containers"
         ? "保持运行中的候选容器数等于设定值；点击切换"
-        : "保持并行任务数等于设定值；点击切换";
+        : "保持并行任务数等于设定值；点击切换");
     }
     const folder = $("#folderSelect");
     if (folder) {
@@ -156,7 +156,7 @@
         )).join("");
         folder.dataset.loaded = "1";
       }
-      folder.value = selected;
+      if (folder.value !== selected) folder.value = selected;
     }
     const path = $("#folderPath");
     if (path) {
@@ -212,6 +212,7 @@
           queued ? `排队候选 ${queued}` : (limit && running >= limit ? "已满" : `空位 ${Math.max(0, limit - running)}`),
           excluded ? `免计 ${excluded}` : "",
           Number(containers.foreign || 0) ? `外部 ${Number(containers.foreign)}` : "",
+          Number(containers.others || 0) ? `验证等 ${Number(containers.others)} 不计` : "",
           phantom ? `忽略失联 ${phantom}` : "",
         ].filter(Boolean).join(" · "),
         meter: limit ? Math.min(100, Math.round((running / limit) * 100)) : null,
@@ -320,26 +321,26 @@
      rebuilding the list with innerHTML on every tick. */
   function renderKeyed(container, items, renderItem, keyOf) {
     if (!container) return;
-    const seen = new Set();
-    const fragment = document.createDocumentFragment();
-    for (const item of items) {
+    const keys = new Set(items.map(keyOf));
+    const existing = new Map();
+    for (const node of Array.from(container.children)) {
+      if (keys.has(node.dataset.key)) existing.set(node.dataset.key, node);
+      else container.removeChild(node);
+    }
+    // Nodes only move when their position changes, so an unchanged list
+    // produces no DOM mutations at all.
+    items.forEach((item, index) => {
       const key = keyOf(item);
-      seen.add(key);
-      let node = container.querySelector(`[data-key="${CSS.escape(key)}"]`);
-      if (node) {
-        container.removeChild(node);
-      } else {
+      let node = existing.get(key);
+      if (!node) {
         node = document.createElement("div");
         node.dataset.key = key;
       }
       const changed = renderItem(node, item);
       if (changed) node.dataset.revision = String(Number(node.dataset.revision || 0) + 1);
-      fragment.appendChild(node);
-    }
-    for (const node of Array.from(container.children)) {
-      if (!seen.has(node.dataset.key)) container.removeChild(node);
-    }
-    container.appendChild(fragment);
+      const at = container.children[index] || null;
+      if (at !== node) container.insertBefore(node, at);
+    });
   }
 
   function setText(node, value) {

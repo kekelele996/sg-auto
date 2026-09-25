@@ -79,6 +79,8 @@ class PlatformProvider:
         self._quota_lock = threading.RLock()
         # Operator blocklist, kept in sync from the service via set_blocklist.
         self._blocked: set[str] = set()
+        # QC-platform use counts (api/qc_usage.py), set by the service.
+        self.project_usage: Any = None
 
     def set_blocklist(self, codes: Iterable[str]) -> None:
         with self._lock:
@@ -327,7 +329,7 @@ class PlatformProvider:
             cached = self._cache.get(cache_key)
             ttl = float((self.config.get("platform") or {}).get("candidateTtlSeconds") or 30)
             if cached and not force and now - float(cached.get("_at") or 0) < ttl:
-                return copy.deepcopy(cached)
+                return self._apply_usage(copy.deepcopy(cached))
         pb, claims = self._modules()
         base_url, token, auth_warning = self._resolve_manager_connection(pb)
         workdir = None
@@ -424,7 +426,39 @@ class PlatformProvider:
         }
         with self._lock:
             self._cache[cache_key] = result
-        return copy.deepcopy(result)
+        return self._apply_usage(copy.deepcopy(result))
+
+    def _apply_usage(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Annotate candidates with their QC use count and drop those at the limit.
+
+        Applied on every read, cached or not: the counts (and the queue items
+        that count as uses) change faster than the Manager listing is cached.
+        """
+        usage = self.project_usage
+        if usage is None:
+            return result
+        task_type = str(result.get("taskType") or "")
+        kept: list[dict[str, Any]] = []
+        excluded = list(result.get("excluded") or [])
+        for item in result.get("items") or []:
+            code = str(item.get("code") or "")
+            try:
+                item["qcUsage"] = usage.usage(code, task_type)
+                reason = usage.blocked_reason(code, task_type)
+            except Exception:
+                reason = ""
+            if reason:
+                excluded.append({"code": code, "reason": reason})
+                continue
+            kept.append(item)
+        result["items"] = kept
+        result["total"] = len(kept)
+        result["excluded"] = excluded[:200]
+        try:
+            result["projectUsage"] = usage.status()
+        except Exception:
+            pass
+        return result
 
     # -- quota movements -------------------------------------------------- #
     def pre_deduct(self, variant_id: str, root_task_type: str, *, base_url: str = "", token: str = "") -> dict[str, Any]:
@@ -500,14 +534,83 @@ class PlatformProvider:
             return self._quota(project, task_type)
         return None
 
+    def verify_login(self, base_url: str = "", username: str = "", password: str = "") -> dict[str, Any]:
+        """Really log in with username + password and confirm who we are.
+
+        Blank arguments fall back to the configured address, user and the
+        saved (Keychain) password.  Returns ``accessToken`` for the caller to
+        exchange; callers must never pass it to the UI.
+        """
+        base = str(base_url or self._auth_cfg().get("managerBaseUrl") or "").strip().rstrip("/")
+        if not base:
+            candidates = discover_manager_base_urls(self.config)
+            base = candidates[0] if candidates else ""
+        if not base:
+            raise MonitorError("未配置 Solo Manager 地址")
+        user = str(username or self._manager_username()).strip()
+        if not user:
+            raise MonitorError("未配置 Solo Manager 用户名")
+        secret = str(password or self._manager_password()).strip()
+        if not secret:
+            raise MonitorError("未保存 Solo Manager 密码，无法验证登录")
+        try:
+            login = manager_request_json(
+                base, "/auth/login", method="POST",
+                payload={"username": user, "password": secret}, timeout=self._manager_timeout(),
+            )
+        except ManagerApiError as exc:
+            if "bad credentials" in str(exc).lower() or exc.status in {401, 403}:
+                raise MonitorError(f"用户名或密码错误（{user}）") from exc
+            raise
+        access_token = str((login or {}).get("accessToken") or (login or {}).get("token") or "").strip()
+        if not access_token:
+            raise MonitorError("Solo Manager 登录成功，但响应里没有 accessToken")
+        me = manager_request_json(base, "/auth/me", token=access_token, timeout=self._manager_timeout())
+        actual = str((me or {}).get("username") or "").strip()
+        if actual and actual.casefold() != user.casefold():
+            raise MonitorError(f"登录后身份为 {actual}，与配置的用户名 {user} 不一致")
+        if isinstance(me, dict) and me.get("enabled") is False:
+            raise MonitorError(f"账号 {user} 已被停用")
+        return {
+            "baseUrl": base,
+            "username": actual or user,
+            "role": str((me or {}).get("role") or ""),
+            "accessToken": access_token,
+        }
+
+    def _token_user(self, base_url: str, token: str) -> str:
+        me = manager_request_json(base_url, "/auth/me", token=token, timeout=self._manager_timeout())
+        return str((me or {}).get("username") or "").strip() if isinstance(me, dict) else ""
+
     def connection_status(self) -> dict[str, Any]:
-        """Cheap health probe for the settings page."""
+        """Settings-page probe: a real password login plus the saved token.
+
+        ``ok`` means the password logs in as the configured user — that is
+        what automatic token renewal depends on.  The token check is reported
+        alongside so an expired or foreign token shows up too.
+        """
+        username = self._manager_username()
+        result: dict[str, Any] = {"ok": False, "username": username, "checkedAt": utc_now()}
+        try:
+            login = self.verify_login()
+            result.update(ok=True, baseUrl=login["baseUrl"], login={"ok": True, "role": login["role"]})
+        except Exception as exc:
+            result["login"] = {"ok": False, "error": redact_text(str(exc), 300)}
+            result["error"] = f"密码登录失败：{result['login']['error']}"
         try:
             pb, _claims = self._modules()
             base_url, token, warning = self._resolve_manager_connection(pb)
-            return {"ok": True, "baseUrl": base_url, "warning": warning, "checkedAt": utc_now()}
+            token_user = self._token_user(base_url, token)
+            result.setdefault("baseUrl", base_url)
+            result["token"] = {"ok": True, "username": token_user}
+            warnings = [warning] if warning else []
+            if token_user and username and token_user.casefold() != username.casefold():
+                result["token"]["ok"] = False
+                warnings.append(f"当前令牌属于 {token_user}，不是配置的 {username}")
+            result["warning"] = "；".join(warnings)
         except Exception as exc:
-            return {"ok": False, "error": redact_text(str(exc), 400), "checkedAt": utc_now()}
+            result["token"] = {"ok": False, "error": redact_text(str(exc), 300)}
+        return result
 
 
 class SubmissionProvider:

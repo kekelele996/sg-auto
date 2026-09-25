@@ -121,7 +121,7 @@ DEFAULT_AUTO_TRIGGER_PROMPT = (
     "使用 `$sologsb-0917`，在监控队列提供的监控工作目录下执行一道完整的 Pair-wise GSB。"
     "仅本地交付：严禁提交 GSB 表单，严禁调用 SOLO2 写接口。\n\n"
     "环境要求：\n"
-    "- Solo Manager 必须使用 admin 对应的有效登录态；当前登录态不是 admin 时立即停止。\n"
+    "- Solo Manager 必须使用 {{manager_username}} 对应的有效登录态；当前登录态不是 {{manager_username}} 时立即停止。\n"
     "- Claude Code Key 从钥匙串 `benzhi-claude-code-gaobo-pi-a453493f` 读取，通过 `SOLOSB_CLAUDE_KEY` 注入；"
     "禁止把明文 Key 写入任务目录、状态文件、轨迹或日志。\n"
     "- 单 Key 全局硬上限为 {{max_containers}} 个候选容器，按“{{max_tasks}} 个任务、每个任务 "
@@ -196,6 +196,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "pausedProbeSeconds": 300,
             "failThreshold": 2,
             "timeoutSeconds": 30,
+        },
+        # Uses per project counted from the QC platform's submissions; at the
+        # limit a project is no longer offered or queued (api/qc_usage.py).
+        "projectUsage": {
+            "enabled": True,
+            "limit": 10,
+            "scope": "total",
+            "refreshSeconds": 120,
         },
         "maxAttempts": 3,
         "retryBackoffSeconds": DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS,
@@ -788,6 +796,7 @@ def render_auto_trigger_prompt(
     max_containers: int = 4,
     candidates_per_task: int = 2,
     schedule_mode: str = SCHEDULE_MODE_CONTAINERS,
+    manager_username: str = "admin",
 ) -> str:
     """Render the platform task prompt with the selected project snapshot."""
     project = project if isinstance(project, dict) else {}
@@ -806,6 +815,7 @@ def render_auto_trigger_prompt(
         "{{max_containers}}": str(max(1, int(max_containers))),
         "{{candidates_per_task}}": str(max(1, int(candidates_per_task))),
         "{{schedule_mode}}": mode_label,
+        "{{manager_username}}": str(manager_username or "").strip() or "admin",
     }
     rendered = str(template or DEFAULT_AUTO_TRIGGER_PROMPT)
     for marker, value in replacements.items():

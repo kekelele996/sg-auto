@@ -24,9 +24,14 @@ SKILL_CONFIG_PATH = Path("~/.codex/sologsb/config.json").expanduser()
 KEY_KEYCHAIN_SERVICE = "benzhi-claude-code-gaobo-pi-a453493f"
 DEFAULT_MODEL = "auto_model/urm"
 
+PROBE_RANGE = (60, 86400)
+PAUSED_PROBE_RANGE = (60, 86400)
+
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    "probeSeconds": 60,
+    # Every probe is a real request on the key and takes one of its
+    # concurrent slots, so the healthy-state probe runs only every 30 minutes.
+    "probeSeconds": 1800,
     "pausedProbeSeconds": 300,
     "failThreshold": 2,
     "timeoutSeconds": 30,
@@ -45,8 +50,8 @@ def llm_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "enabled": bool(cfg.get("enabled", DEFAULTS["enabled"])),
-        "probeSeconds": number("probeSeconds", 15, 3600),
-        "pausedProbeSeconds": number("pausedProbeSeconds", 60, 3600),
+        "probeSeconds": number("probeSeconds", PROBE_RANGE[0], PROBE_RANGE[1]),
+        "pausedProbeSeconds": number("pausedProbeSeconds", PAUSED_PROBE_RANGE[0], PAUSED_PROBE_RANGE[1]),
         "failThreshold": number("failThreshold", 1, 20),
         "timeoutSeconds": number("timeoutSeconds", 5, 120),
         "pausedByGuard": bool(cfg.get("pausedByGuard")),
@@ -79,8 +84,28 @@ def resolve_endpoint(config: dict[str, Any], skill_config_path: Path = SKILL_CON
     return {"baseUrl": base_url, "key": key, "model": model}
 
 
+PROBE_PROMPT = "只回复两个字母：OK"
+PROBE_MAX_TOKENS = 64
+
+
+def _reply_text(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+
+
 def probe_llm(endpoint: dict[str, str], timeout: float = 30) -> dict[str, Any]:
-    """One ``/v1/messages`` call with ``max_tokens=1``; never returns the key."""
+    """Ask the model for a short reply; only a non-empty text answer counts.
+
+    An HTTP 200 alone is not enough: a gateway can answer with an error body
+    or an empty message while the model behind it is down.  Never returns the
+    key.
+    """
     started = time.time()
     result: dict[str, Any] = {
         "ok": False,
@@ -89,6 +114,10 @@ def probe_llm(endpoint: dict[str, str], timeout: float = 30) -> dict[str, Any]:
         "model": endpoint.get("model", ""),
         "status": None,
         "latencyMs": None,
+        "reply": "",
+        "replyModel": "",
+        "stopReason": "",
+        "outputTokens": None,
         "error": "",
     }
     if not endpoint.get("baseUrl"):
@@ -99,8 +128,8 @@ def probe_llm(endpoint: dict[str, str], timeout: float = 30) -> dict[str, Any]:
         return result
     body = json.dumps({
         "model": endpoint["model"],
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": PROBE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": PROBE_PROMPT}],
     }).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint['baseUrl']}/v1/messages",
@@ -116,12 +145,27 @@ def probe_llm(endpoint: dict[str, str], timeout: float = 30) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result["status"] = response.status
-            payload = json.loads(response.read().decode("utf-8") or "{}")
-        if isinstance(payload, dict) and payload.get("type") == "error":
+            raw = response.read().decode("utf-8", "replace")
+        try:
+            payload = json.loads(raw or "{}")
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            result["error"] = f"返回的不是 JSON：{raw[:120]}"
+        elif payload.get("type") == "error":
             error = payload.get("error") or {}
             result["error"] = str(error.get("message") if isinstance(error, dict) else error)[:300]
         else:
-            result["ok"] = True
+            text = _reply_text(payload)
+            usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+            result["reply"] = text[:200]
+            result["replyModel"] = str(payload.get("model") or "")
+            result["stopReason"] = str(payload.get("stop_reason") or "")
+            result["outputTokens"] = usage.get("output_tokens")
+            if text:
+                result["ok"] = True
+            else:
+                result["error"] = f"模型没有返回文本（stop_reason={result['stopReason'] or '空'}）"
     except urllib.error.HTTPError as exc:
         result["status"] = exc.code
         try:
@@ -136,6 +180,10 @@ def probe_llm(endpoint: dict[str, str], timeout: float = 30) -> dict[str, Any]:
     if key and key in result["error"]:
         result["error"] = result["error"].replace(key, "***")
     return result
+
+
+def _iso(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
 
 
 class LlmGuard:
@@ -182,7 +230,10 @@ class LlmGuard:
             "failures": self.failures,
             "lastProbe": dict(self.last_probe),
             "lastChange": self.last_change,
-            "nextProbeInSeconds": max(0, int(next_at - self._clock())) if settings["enabled"] and next_at else None,
+            # An absolute time, not a countdown: the snapshot hub pushes the
+            # page whenever the queue payload changes, and a ticking number
+            # made it re-render every build.
+            "nextProbeAt": _iso(next_at) if settings["enabled"] and next_at else "",
         }
 
     def set_enabled(self, enabled: bool) -> None:
@@ -195,6 +246,27 @@ class LlmGuard:
                 cfg["pausedByGuard"] = False
             self.last_probe_at = 0.0
             self._persist()
+
+    def set_intervals(self, probe_seconds: Any = None, paused_probe_seconds: Any = None) -> dict[str, Any]:
+        """Change how often the key is probed; ``None`` keeps a value as it is."""
+        wanted: dict[str, int] = {}
+        for key, value, (low, high) in (
+            ("probeSeconds", probe_seconds, PROBE_RANGE),
+            ("pausedProbeSeconds", paused_probe_seconds, PAUSED_PROBE_RANGE),
+        ):
+            if value is None:
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} 必须是整数秒") from None
+            if not low <= number <= high:
+                raise ValueError(f"{key} 必须在 {low} 到 {high} 秒之间")
+            wanted[key] = number
+        with self._lock:
+            self._cfg().update(wanted)
+            self._persist()
+        return self.settings()
 
     def note_manual_pause(self) -> None:
         """Any manual start/pause takes ownership of ``paused`` away from the guard."""

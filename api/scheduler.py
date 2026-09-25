@@ -84,6 +84,9 @@ from .common import (
     utc_now,
 )
 
+# Candidate container names the skill gives: sologsb-<task>-candidate-<N>-...
+CANDIDATE_CONTAINER_RE = re.compile(r"^sologsb-.+-candidate-\d+-")
+
 try:  # The worker lives next to the package.
     from ..queue_log import LogWriter
 except Exception:  # pragma: no cover - only hit when running from a stripped copy
@@ -768,9 +771,10 @@ class ContainerLedger:
             "maxContainers": int(max_containers),
             "excludedProjectCodes": sorted({str(code) for code in excluded if str(code).strip()}),
             "managedBy": SKILL_LIMIT_MANAGED_BY,
-            # The limit is machine-wide: the skill counts every running
-            # container, not only its own candidates.
-            "countAllContainers": True,
+            # The limit is the Claude Code key's: the skill counts candidate
+            # containers of every folder, never the databases and servers a
+            # task starts to verify its A/B products.
+            "countAllContainers": False,
         }
         if current == wanted:
             return False
@@ -982,6 +986,8 @@ class QueueManager:
         self.guard_status: dict[str, Any] = {}
         # Set by SchedulerService; its status is shown next to the pause switch.
         self.llm_guard: Any = None
+        # QC-platform use counts (api/qc_usage.py), set by SchedulerService.
+        self.project_usage: Any = None
         # Cleanup totals since start (api/housekeeping.py), set by Housekeeper.
         self.housekeeping_status: dict[str, Any] = {}
         self._disk_low = False
@@ -1161,6 +1167,22 @@ class QueueManager:
             for value in (self._automation_cfg().get("excludedProjectCodes") or [])
             if str(value).strip()
         }
+
+    @staticmethod
+    def _is_candidate_container(item: dict[str, Any]) -> bool:
+        """A Claude Code candidate container, whichever folder or tool started it.
+
+        Only these use the key, so only these count against the limit.  The
+        frontends, backends and databases a task starts to verify or record
+        its A/B products (``gb-133-db``, ``gb62-verify-mongo-a``) do not.
+        """
+        name = str(item.get("name") or "").strip()
+        if CANDIDATE_CONTAINER_RE.match(name):
+            return True
+        if "sologsb-0917=true" in str(item.get("labels") or ""):
+            return True
+        image = str(item.get("image") or "").rsplit("/", 1)[-1]
+        return "claude-code" in image
 
     @staticmethod
     def _container_group_name(container_name: Any) -> str:
@@ -1579,10 +1601,12 @@ class QueueManager:
             return len(active_jobs), detail
 
         group_container_counts: dict[str, int] = {}
-        # Containers started by other tools share the machine-wide limit too.
+        # Candidates started by other tools (same key) share the limit too.
         foreign_containers: list[str] = []
         for item in docker.get("items") or []:
             if not isinstance(item, dict) or str(item.get("state") or "").lower() != "running":
+                continue
+            if not self._is_candidate_container(item):
                 continue
             group = self._container_group_name(item.get("name"))
             if group:
@@ -1726,10 +1750,14 @@ class QueueManager:
             _in_use, detail = self._capacity_usage_locked(startup_timeout)
 
         docker = self.docker_cache.get() if self.docker_cache else {"items": [], "error": ""}
-        running_all = sum(
-            1 for item in docker.get("items") or []
-            if str(item.get("name") or "").strip() and str(item.get("state") or "").lower() == "running"
-        )
+        running = [
+            item for item in docker.get("items") or []
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+            and str(item.get("state") or "").lower() == "running"
+        ]
+        running_all = sum(1 for item in running if self._is_candidate_container(item))
+        # Verification databases/servers etc.: shown, never counted.
+        others = sorted(str(item["name"]).strip() for item in running if not self._is_candidate_container(item))
         counted = int(detail.get("nonTestContainerCount") or 0)
         foreign = list(detail.get("foreignContainers") or [])
         slots = self.slots.snapshot()
@@ -1746,6 +1774,8 @@ class QueueManager:
             "counted": counted,
             "foreign": len(foreign),
             "foreignNames": foreign,
+            "others": len(others),
+            "otherNames": others[:20],
             "reserved": reserved,
             "used": counted + reserved,
             "phantom": detail.get("phantomDemand") or [],
@@ -1840,6 +1870,7 @@ class QueueManager:
             "guard": dict(self.guard_status),
             "llmGuard": self._llm_guard_status(),
             "projectReuse": self.project_reuse(),
+            "projectUsage": self._project_usage_status(),
             "disk": self.disk_status(),
             "capacityMode": "fast",
             "containerGroups": [],
@@ -1860,6 +1891,11 @@ class QueueManager:
             entry["triggerPromptLength"] = len(prompt)
             if prompt:
                 entry["triggerPromptSha256"] = queue_prompt_sha256(prompt)
+            if self.project_usage is not None and entry.get("source", "platform") == "platform" and entry.get("projectCode"):
+                try:
+                    entry["qcUsage"] = self.project_usage.usage(str(entry["projectCode"]), str(entry.get("taskType") or ""))
+                except Exception:
+                    pass
             public.append(entry)
         return public
 
@@ -2028,6 +2064,7 @@ class QueueManager:
             "guard": dict(self.guard_status),
             "llmGuard": self._llm_guard_status(),
             "projectReuse": self.project_reuse(),
+            "projectUsage": self._project_usage_status(),
             "disk": self.disk_status(),
             "capacityMode": capacity_detail.get("mode"),
             "containerGroups": capacity_detail.get("containerGroups") or [],
@@ -2095,6 +2132,12 @@ class QueueManager:
         if side not in {"a", "b", "both"}:
             raise MonitorError("队列 side 只能为 A、B 或 both")
         side = side.upper() if side in {"a", "b"} else "both"
+        if self.project_usage is not None:
+            # Queued items of the same code are refused below, so only the
+            # submitted count matters here.
+            reason = self.project_usage.blocked_reason(project_code, task_type, include_queued=False)
+            if reason:
+                raise MonitorError(f"项目 {project_code} {reason}，不能入队")
         with self._lock:
             if any(
                 item.get("source") == "platform"
@@ -2171,6 +2214,32 @@ class QueueManager:
             return self.llm_guard.status()
         except Exception as exc:
             return {"error": str(exc)}
+
+    def _project_usage_status(self) -> dict[str, Any]:
+        if self.project_usage is None:
+            return {}
+        try:
+            return self.project_usage.status()
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def inflight_project_types(self) -> dict[str, dict[str, int]]:
+        """Platform items pending or running, by code and task type.
+
+        They are uses the QC platform does not show yet.
+        """
+        counts: dict[str, dict[str, int]] = {}
+        with self._lock:
+            for item in self._items:
+                code = str(item.get("projectCode") or "").strip().casefold()
+                if not code or item.get("source", "platform") != "platform":
+                    continue
+                if item.get("status") != "pending" and not self._item_holds_slot(item):
+                    continue
+                task_type = str(item.get("taskType") or "")
+                types = counts.setdefault(code, {})
+                types[task_type] = types.get(task_type, 0) + 1
+        return counts
 
     def pending_count(self) -> int:
         with self._lock:

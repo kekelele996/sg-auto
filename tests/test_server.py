@@ -140,10 +140,16 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
         self.assertEqual(data["settings"]["ui"]["density"], "compact")
-        status, data = self._get("/api/settings")
+        # The saved marker is read live from the Keychain.
+        with mock.patch("api.service.keychain_read", return_value=""):
+            status, data = self._get("/api/settings")
         self.assertEqual(status, 200)
         # Only the saved/unsaved marker may come back, never the secret itself.
         self.assertEqual(data["settings"]["manager"]["passwordSaved"], False)
+        with mock.patch("api.service.keychain_read", return_value="s3cret"):
+            status, data = self._get("/api/settings")
+        self.assertTrue(data["settings"]["manager"]["passwordSaved"])
+        self.assertNotIn("s3cret", json.dumps(data))
         self.assertNotIn("managerPassword", json.dumps(data["settings"]))
 
     def test_settings_answer_without_probing_the_manager(self):

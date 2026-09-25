@@ -7,6 +7,114 @@
   <title>任务队列 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
   <link rel="stylesheet" href="/static/app.css?v=0.4.1">
+  <style>
+    /* ---- status strip: one glance answers "is it running, how full, what needs me" */
+    .qstrip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .qs { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); min-width: 0; }
+    .qs-k { color: var(--text-3); font-size: 12px; white-space: nowrap; }
+    .qs-v { font: 650 18px/1 var(--mono); color: var(--text); white-space: nowrap; }
+    .qs-v small { font-size: 12px; color: var(--text-3); font-weight: 500; }
+    .qs .meter { width: 72px; }
+    .qs[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); background: var(--warn-soft); }
+    .qs[data-tone="warn"] .qs-v { color: var(--warn); }
+    .qs[data-tone="bad"] { border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); background: var(--bad-soft); }
+    .qs[data-tone="bad"] .qs-v { color: var(--bad); }
+    .qs[data-tone="full"] .meter i { background: var(--warn); }
+    .qs-flags { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .flag { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--text-3); font-size: 12px; white-space: nowrap; }
+    .flag::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--line-2); }
+    .flag[data-tone="ok"] { color: var(--text-2); }
+    .flag[data-tone="ok"]::before { background: var(--ok); }
+    .flag[data-tone="warn"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+    .flag[data-tone="warn"]::before { background: var(--warn); }
+
+    /* ---- queue table */
+    .qpanel { overflow: hidden; }
+    .qhead { gap: 12px; flex-wrap: wrap; }
+    .qcols, .qrow { display: grid; grid-template-columns: 22px 96px minmax(0, 1fr) 112px 136px; gap: 12px; align-items: center; padding: 0 16px; }
+    .qcols { height: 30px; border-bottom: 1px solid var(--line); color: var(--text-3); font-size: 11px; letter-spacing: .04em; background: var(--surface-2); }
+    .qgroup { display: flex; align-items: center; gap: 8px; padding: 8px 16px 6px; color: var(--text-3); font-size: 11.5px; font-weight: 650; letter-spacing: .04em; background: var(--surface-2); border-bottom: 1px solid var(--line); }
+    .qgroup b { font: 600 11px/16px var(--mono); padding: 0 6px; border-radius: 999px; background: var(--surface-3); }
+    .qgroup[data-g="attention"] { color: var(--warn); }
+    .qrow { position: relative; min-height: 52px; padding-top: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+    .qrow::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: transparent; }
+    .qrow[data-tone="run"]::before { background: var(--accent); }
+    .qrow[data-tone="warn"]::before { background: var(--warn); }
+    .qrow[data-tone="bad"]::before { background: var(--bad); }
+    .qrow[data-tone="ok"]::before { background: var(--ok); }
+    .qrow:hover { background: var(--surface-2); }
+    .qrow[data-finished="1"] { opacity: .72; }
+    .q-pos { font: 600 12px/1 var(--mono); color: var(--text-3); text-align: right; }
+    .q-status { display: grid; gap: 5px; justify-items: start; min-width: 0; }
+    .q-status .pill { max-width: 100%; }
+    .q-main { min-width: 0; }
+    .q-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .q-name b { flex: 0 1 auto; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .q-name code { flex: 0 4 auto; min-width: 0; font: 12px var(--mono); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .q-detail { margin-top: 2px; color: var(--text-3); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .q-notice { margin-top: 3px; color: var(--warn); font-size: 12px; }
+    .qrow[data-tone="bad"] .q-detail { color: var(--bad); }
+    .q-name > [data-f="type"] { flex: 0 0 auto; display: flex; }
+    /* ---- one colour per task type, shared by tags, bars and the legend */
+    :root { --t-feature: #b9a4ff; --t-zero: #4fd6c2; --t-bug: #ff7a7a; --t-read: #7aa2ff; --t-refactor: #f5a54a; --t-eng: #f178c6; --t-test: #7ddc6a; --t-other: #8a93a3; }
+    html[data-theme="light"] { --t-feature: #7a4cf5; --t-zero: #0b8a7f; --t-bug: #d92d2d; --t-read: #2f6fe4; --t-refactor: #c96a08; --t-eng: #c2378e; --t-test: #2d8f3a; --t-other: #6b7280; }
+    [data-t="feature"] { --t: var(--t-feature); } [data-t="zero"] { --t: var(--t-zero); } [data-t="bug"] { --t: var(--t-bug); }
+    [data-t="read"] { --t: var(--t-read); } [data-t="refactor"] { --t: var(--t-refactor); } [data-t="eng"] { --t: var(--t-eng); }
+    [data-t="test"] { --t: var(--t-test); } [data-t="other"] { --t: var(--t-other); }
+    .q-type { white-space: nowrap; padding: 2px 7px; border-radius: var(--r-sm); font: 600 11px/16px var(--mono); background: var(--surface-3); color: var(--text-2); }
+    .q-type[data-t] { color: var(--t); background: color-mix(in srgb, var(--t) 15%, transparent); }
+    .qlegend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--text-2); }
+    .qlegend > span:first-child { color: var(--text-3); }
+    .qlegend .lg { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .qlegend .lg i { width: 10px; height: 10px; border-radius: 3px; background: var(--t); }
+    .qlegend .lg b { font: 600 12px var(--mono); color: var(--text); }
+    .qlegend .lg[data-zero="1"] { opacity: .45; }
+    .qlegend .lg-q { color: var(--text-3); }
+    .qc { display: grid; gap: 4px; font: 12px var(--mono); color: var(--text-2); }
+    .qc b { color: var(--text); }
+    .qc[data-tone="warn"] > span:first-child { color: var(--warn); }
+    .qc[data-tone="bad"] > span:first-child, .qc[data-tone="bad"] b { color: var(--bad); }
+    .qc-none { color: var(--text-3); font-size: 12px; }
+    .qc-types { display: flex; flex-wrap: wrap; gap: 2px 8px; font: 11px/14px var(--mono); color: var(--text-2); }
+    .qc-types span { white-space: nowrap; color: var(--t); font-weight: 600; }
+    .qc-types span[data-dim="1"] { opacity: .5; font-weight: 500; }
+    .qc-types .none { color: var(--text-3); font-weight: 500; }
+    .q-box { display: flex; gap: 3px; align-items: center; }
+    .q-box i { width: 9px; height: 9px; border-radius: 2px; background: var(--surface-3); box-shadow: inset 0 0 0 1px var(--line-2); }
+    .q-box i.on { background: var(--accent); box-shadow: none; }
+    .q-tools { display: flex; gap: 4px; justify-content: flex-end; }
+    /* secondary actions float over the row on hover instead of taking a column */
+    .q-more { position: absolute; right: 88px; top: 50%; transform: translateY(-50%); display: none; gap: 4px; padding: 3px; border-radius: var(--r-sm); background: var(--surface); box-shadow: 0 0 0 1px var(--line), 0 4px 14px rgb(0 0 0 / .12); }
+    .qrow:hover .q-more, .q-more:focus-within { display: flex; }
+    .q-more[hidden] { display: none !important; }
+    .qempty { padding: 40px 16px; text-align: center; color: var(--text-3); }
+    @media (max-width: 760px) {
+      .qcols { display: none; }
+      .qrow { grid-template-columns: 24px minmax(0, 1fr) auto; }
+      .q-status, .qc-cell { grid-column: 2; }
+      .q-more { position: static; transform: none; display: flex; grid-column: 2; box-shadow: none; padding: 0; background: none; }
+    }
+
+    /* ---- automation card: one line per switch */
+    .auto-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .auto-row:last-child { border-bottom: 0; }
+    .auto-row .switch { margin-top: 1px; }
+    .auto-text { display: grid; gap: 3px; min-width: 0; font-size: 12.5px; color: var(--text-2); }
+    .auto-text > b { color: var(--text); font-size: 13px; }
+    .auto-sub { color: var(--text-3); font-size: 12px; overflow-wrap: anywhere; }
+    .auto-sub:empty { display: none; }
+    .auto-sub[data-tone="warn"], .auto-text [data-tone="warn"] { color: var(--warn); }
+    .auto-row[data-on="0"] .auto-text > b { color: var(--text-2); }
+    .auto-row[data-alert="1"] { background: var(--warn-soft); }
+    .auto-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .auto-inline input { width: 4.2em; padding: 3px 6px; height: 26px; }
+    .auto-inline select { width: auto; padding: 3px 6px; height: 26px; }
+    .auto-more { position: relative; }
+    .auto-more > summary { list-style: none; cursor: pointer; color: var(--text-3); font-size: 12px; white-space: nowrap; padding: 2px 0; }
+    .auto-more > summary::-webkit-details-marker { display: none; }
+    .auto-more > summary span { font-family: var(--mono); }
+    .auto-pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; width: 230px; display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--surface); box-shadow: var(--shadow-lg); }
+  </style>
 </head>
 <body>
 <div class="shell">
@@ -45,7 +153,6 @@
       <div class="head-main">
         <h2 class="head-title">任务队列</h2>
         <span class="pill dot" id="queueState" data-tone="idle">—</span>
-        <span class="pill" id="refillPill" data-tone="idle">自动补队 —</span>
         <span class="head-meta" id="headMeta"></span>
       </div>
       <div class="head-tools">
@@ -55,86 +162,101 @@
     </header>
 
     <div class="page">
-      <div class="band" id="band"></div>
+      <div class="qstrip" id="strip"></div>
 
       <div class="split">
-        <section class="stack">
-          <div class="panel">
-            <div class="panel-head"><h3>执行队列</h3><span id="queueMeta"></span></div>
-            <div class="items" id="queueList"></div>
-            <details class="queue-finished" id="finishedGroup">
-              <summary><span id="finishedMeta">已结束 · 0</span></summary>
-              <div class="items" id="finishedList"></div>
-            </details>
+        <section class="panel qpanel">
+          <div class="panel-head qhead">
+            <div class="segmented" id="filterRow" role="tablist" aria-label="筛选队列">
+              <button type="button" data-filter="all">全部<span class="n" data-n="all">0</span></button>
+              <button type="button" data-filter="attention">需处理<span class="n" data-n="attention">0</span></button>
+              <button type="button" data-filter="executing">执行中<span class="n" data-n="executing">0</span></button>
+              <button type="button" data-filter="waiting">等待<span class="n" data-n="waiting">0</span></button>
+              <button type="button" data-filter="finished">已结束<span class="n" data-n="finished">0</span></button>
+            </div>
+            <span id="queueMeta"></span>
           </div>
-
-          <div class="panel">
-            <div class="panel-head"><h3>执行中</h3><span id="activeMeta"></span></div>
-            <div class="items" id="activeList"></div>
-            <div class="panel-foot"><span class="hint">容器已创建、已交接给执行器的任务。进度和日志在「监看」页查看；任务到达终态后自动离开。</span></div>
+          <div class="qlegend" id="typeLegend" hidden></div>
+          <div class="qcols" aria-hidden="true">
+            <span>#</span><span>状态</span><span>项目</span><span>质检次数</span><span></span>
           </div>
+          <div id="queueRows"></div>
         </section>
 
         <aside class="stack">
-          <div class="panel refill" id="refillPanel" data-on="0">
-            <div class="panel-head">
-              <h3>自动补队</h3>
-              <label class="switch switch-lg" title="开启后按目标待办数从 Solo Manager 自动补充项目">
-                <input type="checkbox" id="refillToggle" role="switch"><span class="track"></span><span id="refillToggleText">已关闭</span>
-              </label>
-            </div>
-            <div class="refill-state">
-              <p id="refillState"></p>
-              <p class="hint" id="refillLast"></p>
-            </div>
-            <div class="preview-head">
-              <b>接下来启动</b><span id="previewMeta"></span>
-            </div>
-            <div class="items preview-list" id="previewList"></div>
-            <details class="refill-weights">
-              <summary>补队比例 <span id="refillMeta"></span></summary>
-              <div class="panel-body grid" style="gap:8px">
-                <div class="field">
-                  <label for="weightInput">迭代占比（%）</label>
-                  <div class="row-inline">
-                    <input class="input" id="weightInput" type="number" min="0" max="100">
-                    <button class="btn" id="saveWeightBtn" type="button">应用</button>
-                  </div>
+          <div class="panel">
+            <div class="panel-head"><h3>自动化</h3><span id="autoMeta"></span></div>
+            <div class="auto" id="autoList">
+              <div class="auto-row" id="refillRow">
+                <label class="switch" title="待启动不足目标数时从 Solo Manager 自动补充项目">
+                  <input type="checkbox" id="refillToggle" role="switch"><span class="track"></span>
+                </label>
+                <div class="auto-text">
+                  <b>自动补队</b>
+                  <span id="refillState"></span>
+                  <span class="auto-sub" id="refillLast"></span>
                 </div>
-                <p class="hint" id="weightHint"></p>
+                <details class="auto-more">
+                  <summary title="补队比例">比例 <span id="refillMeta"></span></summary>
+                  <div class="auto-pop">
+                    <label class="hint" for="weightInput">迭代占比（%）</label>
+                    <div class="row-inline">
+                      <input class="input" id="weightInput" type="number" min="0" max="100">
+                      <button class="btn sm" id="saveWeightBtn" type="button">应用</button>
+                    </div>
+                    <span class="hint" id="weightHint"></span>
+                  </div>
+                </details>
               </div>
-            </details>
-          </div>
 
-          <div class="panel" id="llmPanel">
-            <div class="panel-head">
-              <h3>大模型断连自动启停</h3>
-              <label class="switch" title="容器调用的大模型连续不可用时自动暂停队列，暂停期间定时复测，恢复后自动启动">
-                <input type="checkbox" id="llmGuardToggle" role="switch"><span class="track"></span><span id="llmGuardText">已关闭</span>
-              </label>
-            </div>
-            <div class="refill-state">
-              <p id="llmState"></p>
-              <p class="hint" id="llmLast"></p>
-            </div>
-            <div class="panel-foot">
-              <button class="btn sm" id="llmTestBtn" type="button">测试容器 API 连通性</button>
-              <span class="hint" id="llmEndpoint"></span>
+              <div class="auto-row" id="llmRow">
+                <label class="switch" title="容器调用的大模型连续不可用时自动暂停队列，恢复后自动启动">
+                  <input type="checkbox" id="llmGuardToggle" role="switch"><span class="track"></span>
+                </label>
+                <div class="auto-text">
+                  <b>大模型断连自动启停</b>
+                  <span class="auto-inline">
+                    每 <input class="input" id="llmProbeMinutes" type="number" min="1" max="1440" step="1" aria-label="探测间隔（分钟）"> 分钟探测，
+                    暂停后每 <input class="input" id="llmPausedMinutes" type="number" min="1" max="1440" step="1" aria-label="暂停后复测间隔（分钟）"> 分钟复测
+                  </span>
+                  <span id="llmState"></span>
+                  <span class="auto-sub" id="llmLast"></span>
+                </div>
+                <button class="btn ghost sm" id="llmTestBtn" type="button" title="">测试</button>
+              </div>
+
+              <div class="auto-row" id="reuseRow">
+                <label class="switch" title="开启：跑完的项目可以再次入队；关闭：进过队列的项目不再入队">
+                  <input type="checkbox" id="reuseToggle" role="switch"><span class="track"></span>
+                </label>
+                <div class="auto-text">
+                  <b>项目可重用</b>
+                  <span id="reuseHint"></span>
+                </div>
+              </div>
+
+              <div class="auto-row" id="usageRow">
+                <label class="switch" title="按质检平台上的提交记录统计每个项目用了几次，达到上限的项目不再入队">
+                  <input type="checkbox" id="usageToggle" role="switch"><span class="track"></span>
+                </label>
+                <div class="auto-text">
+                  <b>质检次数上限</b>
+                  <span class="auto-inline">
+                    每个项目 <input class="input" id="usageLimit" type="number" min="1" max="1000" step="1"> 次
+                    <select class="input" id="usageScope" aria-label="统计口径">
+                      <option value="total">0-1 与迭代合计</option>
+                      <option value="perType">0-1 与迭代分别</option>
+                    </select>
+                  </span>
+                  <span class="auto-sub" id="usageState"></span>
+                </div>
+                <button class="btn ghost sm" id="usageRefreshBtn" type="button" title="立即从质检平台拉取">刷新</button>
+              </div>
             </div>
           </div>
 
           <div class="panel">
-            <div class="panel-head">
-              <h3>项目可重用</h3>
-              <label class="switch" title="开启：跑完的项目可以再次入队；关闭：进过队列的项目不再入队">
-                <input type="checkbox" id="reuseToggle" role="switch"><span class="track"></span><span id="reuseText">可重用</span>
-              </label>
-            </div>
-            <div class="panel-body"><p class="hint" id="reuseHint"></p></div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-head"><h3>添加 Solo Manager 项目</h3><span id="platformMeta">读取中…</span></div>
+            <div class="panel-head"><h3>添加项目</h3><span id="platformMeta">读取中…</span></div>
             <div class="panel-tools">
               <label class="search" style="max-width:none">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -145,7 +267,7 @@
                   <option value="0-1代码生成">0-1 代码生成</option>
                   <option value="feature迭代">feature 迭代</option>
                 </select>
-                <select class="input" id="difficultySelect" aria-label="难度" style="flex:0 0 96px">
+                <select class="input" id="difficultySelect" aria-label="难度" style="flex:0 0 88px">
                   <option>困难</option>
                   <option>地狱</option>
                 </select>
@@ -155,46 +277,45 @@
                   <input type="checkbox" id="poolToggle" role="switch"><span class="track"></span>包含项目池
                 </label>
                 <span class="row-inline" style="gap:4px">
-                  <button class="btn ghost sm" id="randomBtn" type="button">随机选择</button>
+                  <button class="btn ghost sm" id="randomBtn" type="button">随机</button>
                   <button class="btn ghost sm" id="reloadProjectsBtn" type="button">刷新</button>
                 </span>
               </div>
             </div>
-            <div class="items scroll-list" id="projectList" style="max-height:340px"></div>
+            <div class="items scroll-list" id="projectList" style="max-height:300px"></div>
             <div class="panel-foot">
               <span class="scope grow" id="selectedHint">未选择项目</span>
               <button class="btn primary" id="addBtn" type="button" disabled>加入队列</button>
             </div>
           </div>
 
-          <div class="panel">
-            <div class="panel-head"><h3>调度模式与上限</h3><span id="modeMeta"></span></div>
+          <details class="panel">
+            <summary class="panel-head"><h3>调度上限</h3><span id="modeMeta"></span></summary>
             <div class="panel-body grid grid-2">
               <div class="field" style="grid-column:1/-1">
                 <label for="modeSelect">模式</label>
                 <select class="input" id="modeSelect">
-                  <option value="containers">容器优先</option>
-                  <option value="tasks">任务数量优先</option>
+                  <option value="containers">容器优先 · 保持运行中的候选容器数等于上限</option>
+                  <option value="tasks">任务数量优先 · 保持并行任务数等于上限</option>
                 </select>
-                <span class="hint">容器优先保持运行中的候选容器数等于设定值；任务数量优先保持并行任务数等于设定值。</span>
               </div>
               <div class="field"><label for="maxContainersInput">最大容器数</label><input class="input" id="maxContainersInput" type="number" min="1" max="6">
-                <span class="hint">监控台与技能共用，技能侧硬顶 6。</span></div>
+                <span class="hint">与技能共用，硬顶 6。</span></div>
               <div class="field"><label for="candidatesInput">单任务候选数</label><input class="input" id="candidatesInput" type="number" min="2" max="8">
                 <span class="hint">2–8。</span></div>
               <div class="field"><label for="maxTasksInput">最大任务数</label><input class="input" id="maxTasksInput" type="number" min="1" max="20">
-                <span class="hint">仅「任务数量优先」生效。</span></div>
+                <span class="hint">仅任务数量优先生效。</span></div>
               <div class="field"><label for="cooldownInput">启动间隔（秒）</label><input class="input" id="cooldownInput" type="number" min="0" max="86400">
                 <span class="hint">最低 20 秒。</span></div>
             </div>
             <div class="panel-foot">
               <span class="scope grow" id="limitsHint"></span>
-              <button class="btn primary" id="saveLimitsBtn" type="button">应用上限</button>
+              <button class="btn primary" id="saveLimitsBtn" type="button">应用</button>
             </div>
-          </div>
+          </details>
 
-          <div class="panel guard" id="guardPanel" data-mode="observe">
-            <div class="panel-head"><h3>兜底策略</h3><span id="guardMeta"></span></div>
+          <details class="panel guard" id="guardPanel" data-mode="observe">
+            <summary class="panel-head"><h3>兜底策略</h3><span id="guardMeta"></span></summary>
             <div class="panel-body grid" style="gap:12px">
               <div class="segmented" id="guardModeRow" role="radiogroup" aria-label="兜底模式">
                 <button type="button" data-mode="off" role="radio">关闭</button>
@@ -204,14 +325,12 @@
               <p class="guard-mode-hint" id="guardModeHint"></p>
               <div class="grid grid-2" style="gap:10px">
                 <div class="field"><label for="guardCandidateInput">候选阶段上限（小时）</label>
-                  <input class="input" id="guardCandidateInput" type="number" min="1" max="48" step="0.5">
-                  <span class="hint">目前最慢的正常竞速 5.5 小时。</span></div>
+                  <input class="input" id="guardCandidateInput" type="number" min="1" max="48" step="0.5"></div>
                 <div class="field"><label for="guardQuietInput">无进展上限（分钟）</label>
-                  <input class="input" id="guardQuietInput" type="number" min="15" max="1440">
-                  <span class="hint">状态、候选输出、轨迹、日志都没写入。</span></div>
-                <div class="field" style="grid-column:1/-1"><label for="guardLeakInput">残留进程：任务结束后（分钟）</label>
+                  <input class="input" id="guardQuietInput" type="number" min="15" max="1440"></div>
+                <div class="field" style="grid-column:1/-1"><label for="guardLeakInput">任务结束后残留进程（分钟）</label>
                   <input class="input" id="guardLeakInput" type="number" min="10" max="1440">
-                  <span class="hint">已结束且无人持有的任务目录下仍在跑的进程（如 vite）；终端 shell 与 queue_worker 不动。</span></div>
+                  <span class="hint">已结束且无人持有的任务目录下仍在跑的进程；终端 shell 与 queue_worker 不动。</span></div>
               </div>
             </div>
             <div class="guard-hits" id="guardHits"></div>
@@ -219,25 +338,18 @@
               <span class="scope grow" id="guardLast"></span>
               <button class="btn" id="saveGuardBtn" type="button">应用阈值</button>
             </div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-head"><h3>占用概览</h3><span id="usageMeta"></span></div>
-            <div class="tiles" id="usageTiles" style="grid-template-columns:repeat(4,1fr)"></div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-head"><h3>已禁用项目</h3><span id="disabledMeta"></span></div>
-            <div class="items" id="disabledList"></div>
-            <div class="panel-foot"><span class="hint">禁用的项目会从项目选择器和自动补队中移除，不会再次入队。</span></div>
-          </div>
+          </details>
 
           <details class="panel">
-            <summary class="panel-head">
-              <h3>触发 Prompt 模板</h3><span id="templateCount"></span>
-            </summary>
+            <summary class="panel-head"><h3>已禁用项目</h3><span id="disabledMeta"></span></summary>
+            <div class="items" id="disabledList"></div>
+          </details>
+
+          <details class="panel">
+            <summary class="panel-head"><h3>Prompt 模板</h3><span id="templateCount"></span></summary>
             <div class="panel-body grid" style="gap:10px">
               <textarea id="promptTemplate" spellcheck="false"></textarea>
+              <span class="hint">可用变量：{{manager_username}} {{selected_project}} {{task_type}} {{difficulty}} {{max_containers}} {{max_tasks}} {{candidates_per_task}} {{schedule_mode}} {{base_url}}</span>
               <div class="row-inline">
                 <button class="btn primary" id="saveTemplateBtn" type="button">保存模板</button>
                 <span class="hint">加入队列前会自动保存未保存的修改。</span>
@@ -253,39 +365,47 @@
 <script src="/static/app.js?v=0.4.1"></script>
 <script>
   const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtDuration, toast, TASK_STATE_LABELS,
-          initTheme, renderRail, renderMetrics, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
+          initTheme, renderRail, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
 
   // ``phase`` is computed by the server from the item, its state.json and
   // docker ps; it is what the operator cares about (see QueueManager._annotate_phase).
-  const PHASE_LABELS = { queued: "排队中", waiting_slot: "等待容器名额", retrying: "等待重试", starting: "启动中",
+  const PHASE_LABELS = { queued: "排队中", waiting_slot: "等容器名额", retrying: "等待重试", starting: "启动中",
     executing: "执行中", attention: "需处理", done: "已完成", failed: "失败", skipped: "已跳过" };
-  const PHASE_TONES = { queued: "idle", waiting_slot: "idle", retrying: "idle", starting: "run",
+  const PHASE_TONES = { queued: "idle", waiting_slot: "idle", retrying: "warn", starting: "run",
     executing: "run", attention: "warn", done: "ok", failed: "bad", skipped: "idle" };
   const WAITING_PHASES = new Set(["queued", "waiting_slot", "retrying", "starting"]);
   const FINISHED_PHASES = new Set(["done", "failed", "skipped"]);
-  const QUOTA_LABELS = { pending: "配额待扣", claimed: "已预扣", settled: "已结算", refunded: "已回补", superseded: "执行器已接管" };
-  const QUOTA_TONES = { settled: "ok", refunded: "warn" };
+  const GROUPS = [
+    { key: "attention", label: "需处理", test: (item) => item.phase === "attention" },
+    { key: "executing", label: "执行中", test: (item) => item.phase === "executing" },
+    { key: "waiting", label: "等待启动（按启动顺序）", test: (item) => WAITING_PHASES.has(item.phase) },
+    { key: "finished", label: "已结束", test: (item) => FINISHED_PHASES.has(item.phase) },
+  ];
+  const QUOTA_LABELS = { claimed: "已预扣", settled: "已结算", refunded: "已回补", superseded: "执行器接管" };
 
-  const state = { snapshot: null, projects: [], selected: null, query: "", templateDirty: false, connected: false, error: "", refillBusy: false };
+  const state = { snapshot: null, projects: [], selected: null, query: "", templateDirty: false, connected: false, error: "",
+    refillBusy: false, llmBusy: false, filter: "all" };
+  try { state.filter = localStorage.getItem("sologsb-queue-filter") || "all"; } catch (e) { /* private window */ }
   initTheme();
 
-  /* ------------------------------------------------------------------ queue */
   const stateLabel = (value) => TASK_STATE_LABELS[value] || value || "";
+  const queueOf = () => (state.snapshot || {}).queue || {};
 
-  // One line saying what the item is doing right now, from facts the server
-  // sends; the raw state-machine notices are secondary.
+  // One line saying what the item is doing right now, from facts the server sends.
   function phaseDetail(item) {
     const containers = item.containers || {};
     const running = containers.running || 0;
     const wanted = containers.wanted || 0;
     switch (item.phase) {
       case "queued":
-        return [item.queuePosition ? `排队第 ${item.queuePosition} 位` : "", item.containerWait || ""].filter(Boolean).join(" · ");
+        return item.containerWait || "排队中，轮到后自动启动";
       case "waiting_slot":
         if (item.status === "pending") return item.containerWait || "容器名额已满，有空位自动启动";
-        return `候选 ${running}/${wanted} 已有容器，其余在执行器内排队等待容器名额`;
-      case "retrying":
-        return item.notice || "等待自动重试";
+        return `候选 ${running}/${wanted} 已有容器，其余等待名额`;
+      case "retrying": {
+        const at = Date.parse(item.nextAttemptAt || "");
+        return `${Number.isFinite(at) ? `${fmtClock(item.nextAttemptAt)} 后重试` : "等待自动重试"}${item.lastError ? ` · ${item.lastError}` : ""}`;
+      }
       case "starting":
         if (item.status === "launching") return "正在启动执行器";
         if (item.status === "running") return "执行器已启动，正在创建桌面任务";
@@ -293,175 +413,314 @@
         return `${stateLabel(item.stateStatus)} · 等待候选启动`;
       case "executing": {
         const since = item.triggeredAt ? ` · 已运行 ${fmtDuration((Date.now() - Date.parse(item.triggeredAt)) / 1000)}` : "";
-        if (running) return `${running} 个候选容器运行中 · ${stateLabel(item.stateStatus)}${since}`;
-        return `候选阶段结束 · ${stateLabel(item.stateStatus)}${since}`;
+        return `${running ? `${running} 个候选运行中` : "候选阶段结束"} · ${stateLabel(item.stateStatus)}${since}`;
       }
       case "attention":
         return item.error || item.notice || "需人工确认桌面任务是否已停止";
       case "failed":
         return item.error || item.lastError || "失败";
+      case "done":
+        return item.finishedAt ? `${fmtClock(item.finishedAt)} 完成` : "已完成";
       default:
         return item.notice || item.error || "";
     }
   }
 
-  function renderQueueItem(node, item) {
+  /* ----------------------------------------------------------- QC usage */
+  // Every Solo Manager task type, in legend order. Names are matched without
+  // case ("Feature迭代" and "feature迭代" are the same type).
+  const TYPES = [
+    { name: "feature迭代", short: "迭代", key: "feature" },
+    { name: "0-1代码生成", short: "0-1", key: "zero" },
+    { name: "Bug修复", short: "Bug", key: "bug" },
+    { name: "代码理解", short: "理解", key: "read" },
+    { name: "代码重构", short: "重构", key: "refactor" },
+    { name: "工程化", short: "工程", key: "eng" },
+    { name: "代码测试", short: "测试", key: "test" },
+  ];
+  const TYPE_BY_NAME = new Map(TYPES.map((type) => [type.name.toLowerCase(), type]));
+  function typeOf(name) {
+    const text = String(name || "").trim();
+    return TYPE_BY_NAME.get(text.toLowerCase().replace(/\s+/g, ""))
+      || { name: text || "未知", short: text || "未知", key: "other" };
+  }
+  const typeRank = (name) => { const index = TYPES.indexOf(typeOf(name)); return index < 0 ? TYPES.length : index; };
+  const byTypeOrder = (counts) => Object.entries(counts || {})
+    .filter(([, n]) => Number(n) > 0)
+    .sort(([a], [b]) => typeRank(a) - typeRank(b));
+
+  function usageBreakdown(usage) {
+    const parts = byTypeOrder(usage.byType).map(([type, n]) => `${typeOf(type).name} ${n}`);
+    return parts.length ? parts.join("，") : "未使用";
+  }
+
+  // Legend above the table: every type's colour and its QC submissions in total.
+  function renderLegend() {
+    const usage = queueOf().projectUsage || {};
+    const legend = $("#typeLegend");
+    legend.hidden = !usage.loaded;
+    if (!usage.loaded) return;
+    const totals = new Map();
+    for (const [name, n] of Object.entries(usage.byType || {})) {
+      const type = typeOf(name);
+      totals.set(type, (totals.get(type) || 0) + Number(n || 0));
+    }
+    const extra = [...totals.keys()].filter((type) => !TYPES.includes(type));
+    setHtml(legend, `<span>质检已提交</span>` + [...TYPES, ...extra].map((type) => {
+      const n = totals.get(type) || 0;
+      return `<span class="lg" data-t="${type.key}" data-zero="${n ? 0 : 1}" title="${esc(type.name)}：质检平台已提交 ${n} 次"><i></i>${esc(type.name)} <b>${n}</b></span>`;
+    }).join("") + `<span class="lg lg-q" title="已在我们队列中、还没提交到质检平台">+n = 队列中</span>`);
+  }
+
+  // "4/10" plus one coloured "type used+queued" per task type, in legend colours.
+  function usageCell(usage) {
+    if (!usage || !usage.loaded) return `<span class="qc-none">—</span>`;
+    const limit = Math.max(1, usage.limit || 10);
+    const used = usage.used || 0;
+    const queued = usage.queued || 0;
+    const left = limit - used - queued;
+    const tone = left < 0 ? "bad" : left <= 1 ? "warn" : "";
+    // perType scope counts only the item's own type; the other types still
+    // show in the per-type line, dimmed, so every type's use stays visible.
+    const own = usage.scope === "perType" && usage.taskType ? typeOf(usage.taskType) : null;
+    const counted = (type) => !own || typeOf(type) === own;
+    const types = new Map();
+    for (const [name, n] of byTypeOrder(usage.byType)) types.set(typeOf(name), { used: Number(n), queued: 0 });
+    for (const [name, n] of byTypeOrder(usage.queuedByType)) {
+      const entry = types.get(typeOf(name)) || { used: 0, queued: 0 };
+      entry.queued += Number(n);
+      types.set(typeOf(name), entry);
+    }
+    const ordered = [...types.entries()].sort(([a], [b]) => typeRank(a.name) - typeRank(b.name));
+    const chips = ordered.map(([type, n]) => `<span data-t="${type.key}" data-dim="${counted(type.name) ? 0 : 1}">${esc(type.short)} ${n.used}${n.queued ? `+${n.queued}` : ""}</span>`).join("");
+    const lines = ordered.map(([type, n]) => `${type.name}：已提交 ${n.used}${n.queued ? `，队列中 ${n.queued}` : ""}${counted(type.name) ? "" : "（不计入本类型上限）"}`);
+    const head = own ? `按类型计数：${own.name} 已用 ${used}${queued ? ` + 队列中 ${queued}` : ""} / ${limit}` : `合计计数：已用 ${used}${queued ? ` + 队列中 ${queued}` : ""} / ${limit}`;
+    const tip = [head, ...lines, `剩 ${Math.max(0, left)} 次`].join("\n");
+    return `<span class="qc" data-tone="${tone}" title="${esc(tip)}">
+      <span><b>${esc(used)}</b>${queued ? `+${esc(queued)}` : ""} / ${esc(limit)}</span>
+      <span class="qc-types">${chips || `<span class="none">未使用</span>`}</span></span>`;
+  }
+
+  /* ------------------------------------------------------------------ rows */
+  function rowTools(item, phase) {
+    const active = ["launching", "running", "triggered", "orphaned"].includes(item.status) || item.capacityHeld;
+    const main = [];
+    const more = [];
+    if (item.status === "orphaned" || (item.capacityHeld && ["failed", "skipped"].includes(item.status))) {
+      main.push(`<button class="btn sm" data-q="release" data-id="${esc(item.id)}">释放名额</button>`);
+    }
+    if (!item.capacityHeld && ["failed", "skipped"].includes(item.status)) {
+      main.push(`<button class="btn sm" data-q="retry" data-id="${esc(item.id)}">重试</button>`);
+    }
+    if (item.monitorTaskId && !FINISHED_PHASES.has(phase)) {
+      main.push(`<a class="btn ghost sm" href="/?task=${encodeURIComponent(item.monitorTaskId)}" title="在监看页查看进度和日志">监看</a>`);
+    }
+    if (item.triggerPromptLength) {
+      more.push(`<button class="btn ghost sm" data-q="prompt" data-id="${esc(item.id)}" title="复制任务 Prompt">Prompt</button>`);
+    }
+    if (item.projectCode) {
+      more.push(`<button class="btn ghost sm" data-q="disable" data-id="${esc(item.id)}" data-code="${esc(item.projectCode)}" title="禁用该项目，不再入队">禁用</button>`);
+    }
+    if (!active) more.push(`<button class="btn ghost sm" data-q="remove" data-id="${esc(item.id)}" title="从队列删除">删除</button>`);
+    return { main: main.join(""), more: more.join("") };
+  }
+
+  function renderGroup(node, group) {
     let changed = false;
-    changed = setAttr(node, "data-id", item.id) || changed;
+    if (node.className !== "qgroup") node.className = "qgroup";
+    changed = setAttr(node, "data-g", group.key) || changed;
+    changed = setHtml(node, `${esc(group.label)}<b>${esc(group.count)}</b>`) || changed;
+    return changed;
+  }
+
+  function renderRow(node, item) {
+    if (item.group) return renderGroup(node, item.group);
+    let changed = false;
     if (node.dataset.built !== "1") {
-      node.className = "item";
-      node.innerHTML = `<div class="item-main">
-          <div class="item-name"><span class="t" data-f="name"></span><code data-f="code"></code></div>
-          <div class="item-pills" data-f="pills"></div>
-          <div class="item-detail" data-f="detail"></div>
-          <div class="item-notice" data-f="notice"></div>
+      node.className = "qrow";
+      node.innerHTML = `<span class="q-pos" data-f="pos"></span>
+        <span class="q-status"><span data-f="status"></span><span class="q-box" data-f="box"></span></span>
+        <div class="q-main">
+          <div class="q-name"><span data-f="type"></span><b data-f="name"></b><code data-f="code"></code></div>
+          <div class="q-detail" data-f="detail"></div>
+          <div class="q-notice" data-f="notice" hidden></div>
         </div>
-        <div class="item-tools" data-f="tools"></div>`;
+        <span class="qc-cell" data-f="qc"></span>
+        <div class="q-tools" data-f="tools"></div>
+        <div class="q-more" data-f="more"></div>`;
       node.dataset.built = "1";
     }
     const f = (name) => node.querySelector(`[data-f="${name}"]`);
     const phase = item.phase || item.status;
-    const tone = PHASE_TONES[phase] || "idle";
-    changed = setAttr(node, "data-tone", (item.guardFlag || {}).policy && !FINISHED_PHASES.has(phase) ? "warn" : tone) || changed;
-    changed = setAttr(node, "data-phase", phase) || changed;
-    const title = item.taskName || item.projectCode || item.id;
-    changed = setText(f("name"), title) || changed;
-    changed = setText(f("code"), item.projectCode && item.projectCode !== title ? item.projectCode : "") || changed;
-    const quota = item.quota || {};
-    const containers = item.containers || {};
-    const meta = [
-      item.source === "platform" ? String(item.taskType || "Solo Manager") : "本地任务",
-      item.attempts ? `第 ${item.attempts + 1} 次尝试` : "",
-      item.stalledRetryCount ? `静默重试 ${item.stalledRetryCount}` : "",
-    ].filter(Boolean);
-    changed = setHtml(f("pills"), [
-      `<span class="pill dot" data-tone="${tone}">${esc(PHASE_LABELS[phase] || phase)}</span>`,
-      containers.wanted || containers.running
-        ? `<span class="pill" data-tone="${containers.running >= containers.wanted ? "run" : "idle"}" title="已创建容器 / 本轮候选数">容器 ${esc(containers.running || 0)}/${esc(Math.max(containers.wanted || 0, containers.running || 0))}</span>`
-        : "",
-      quota.state && quota.state !== "pending"
-        ? `<span class="pill" data-tone="${QUOTA_TONES[quota.state] || "idle"}" title="${esc(quota.refundReason || "")}">${esc(QUOTA_LABELS[quota.state] || quota.state)}</span>`
-        : "",
-      `<span class="item-sub">${meta.map(esc).join('<span class="sep">·</span>')}</span>`,
-    ].join("")) || changed;
-    changed = setText(f("detail"), phaseDetail(item)) || changed;
-    // The state-machine notice only when it adds something the detail line
-    // does not already say (a stalled task, a retry's cause, a skip reason).
-    let notice = "";
-    if (phase === "retrying") notice = item.lastError && item.lastError !== item.notice ? `原因：${item.lastError}` : "";
-    else if (phase === "executing" || phase === "waiting_slot" || phase === "starting") notice = item.noticeKind === "stalled" ? item.notice : "";
-    else if (phase === "skipped") notice = item.notice || item.error || "";
-    else if (phase === "done") notice = "";
     const flag = item.guardFlag || {};
-    if (flag.policy && !FINISHED_PHASES.has(phase)) {
-      notice = `兜底策略：${flag.label}，${flag.reason}${(((state.snapshot || {}).queue || {}).guard || {}).mode === "enforce" ? "" : "（仅观察，未终止）"}`;
+    const flagged = Boolean(flag.policy) && !FINISHED_PHASES.has(phase);
+    const tone = flagged ? "warn" : (PHASE_TONES[phase] || "idle");
+    changed = setAttr(node, "data-id", item.id) || changed;
+    changed = setAttr(node, "data-tone", tone) || changed;
+    changed = setAttr(node, "data-phase", phase) || changed;
+    changed = setAttr(node, "data-finished", FINISHED_PHASES.has(phase) ? "1" : "0") || changed;
+    changed = setText(f("pos"), item.position ? String(item.position) : "") || changed;
+    const quota = item.quota || {};
+    const quotaTip = quota.state && QUOTA_LABELS[quota.state] ? ` · 配额${QUOTA_LABELS[quota.state]}` : "";
+    const attempts = item.attempts ? ` · 第 ${item.attempts + 1} 次` : "";
+    changed = setHtml(f("status"), `<span class="pill dot" data-tone="${tone}" title="${esc(`${PHASE_LABELS[phase] || phase}${attempts}${quotaTip}`)}">${esc(PHASE_LABELS[phase] || phase)}</span>`) || changed;
+    const title = item.projectName || item.taskName || item.projectCode || item.id;
+    changed = setText(f("name"), title) || changed;
+    changed = setAttr(f("name"), "title", title) || changed;
+    changed = setText(f("code"), item.projectCode && item.projectCode !== title ? item.projectCode : "") || changed;
+    const detail = phaseDetail(item);
+    changed = setText(f("detail"), detail) || changed;
+    changed = setAttr(f("detail"), "title", detail) || changed;
+    let notice = "";
+    if (flagged) {
+      notice = `兜底策略：${flag.label}，${flag.reason}${(queueOf().guard || {}).mode === "enforce" ? "" : "（仅观察，未终止）"}`;
+    } else if (["executing", "waiting_slot", "starting"].includes(phase) && item.noticeKind === "stalled") {
+      notice = item.notice || "";
+    } else if (phase === "skipped") {
+      notice = item.notice || item.error || "";
     }
     changed = setText(f("notice"), notice) || changed;
-    f("notice").hidden = !notice;
-
-    const active = ["launching", "running", "triggered", "orphaned"].includes(item.status) || item.capacityHeld;
-    const buttons = [];
-    if (item.status === "orphaned" || (item.capacityHeld && ["failed", "skipped"].includes(item.status))) {
-      buttons.push(`<button class="btn sm" data-q="release" data-id="${esc(item.id)}">释放名额</button>`);
-    }
-    if (!item.capacityHeld && ["failed", "skipped"].includes(item.status)) {
-      buttons.push(`<button class="btn sm" data-q="retry" data-id="${esc(item.id)}">重试</button>`);
-    }
-    if (item.monitorTaskId && !FINISHED_PHASES.has(phase)) {
-      buttons.push(`<a class="btn ghost sm" href="/?task=${encodeURIComponent(item.monitorTaskId)}" title="在监看页查看">监看</a>`);
-    }
-    if (item.triggerPromptLength) {
-      buttons.push(`<button class="btn ghost sm" data-q="prompt" data-id="${esc(item.id)}" title="复制任务 Prompt">Prompt</button>`);
-    }
-    buttons.push(`<button class="btn ghost sm" data-q="disable" data-id="${esc(item.id)}" data-code="${esc(item.projectCode || "")}">禁用</button>`);
-    buttons.push(`<button class="btn ghost sm" data-q="remove" data-id="${esc(item.id)}" ${active ? "disabled title=\"运行中的队列项不能删除\"" : ""}>删除</button>`);
-    changed = setHtml(f("tools"), buttons.join("")) || changed;
+    if (f("notice").hidden !== !notice) f("notice").hidden = !notice;
+    const type = item.source === "platform" ? String(item.taskType || "") : "";
+    const kind = type ? typeOf(type) : null;
+    changed = setHtml(f("type"), `<span class="q-type"${kind ? ` data-t="${kind.key}"` : ""} title="${esc(kind ? kind.name : "本地任务")}${item.difficulty ? ` · ${esc(item.difficulty)}` : ""}">${esc(kind ? kind.short : "本地")}</span>`) || changed;
+    changed = setHtml(f("qc"), usageCell(item.qcUsage)) || changed;
+    const containers = item.containers || {};
+    const wanted = Math.max(containers.wanted || 0, containers.running || 0);
+    const running = containers.running || 0;
+    changed = setHtml(f("box"), wanted
+      ? `<span title="已创建容器 ${running} / 本轮候选 ${wanted}" style="display:flex;gap:3px">${Array.from({ length: wanted }, (_, i) => `<i class="${i < running ? "on" : ""}"></i>`).join("")}</span>`
+      : "") || changed;
+    const tools = rowTools(item, phase);
+    changed = setHtml(f("tools"), tools.main) || changed;
+    changed = setHtml(f("more"), tools.more) || changed;
+    const more = f("more");
+    if (more.hidden !== !tools.more) more.hidden = !tools.more;
     return changed;
   }
 
-  function renderQueue() {
-    const queue = (state.snapshot || {}).queue || {};
-    const items = queue.items || [];
-    // Attention first (it needs a hand), then the waiting items in queue order.
-    const waiting = [
-      ...items.filter((item) => item.phase === "attention"),
-      ...items.filter((item) => WAITING_PHASES.has(item.phase)),
-    ];
-    const executing = items.filter((item) => item.phase === "executing");
-    const finished = items.filter((item) => FINISHED_PHASES.has(item.phase));
+  function bucketOf(item) {
+    const group = GROUPS.find((g) => g.test(item));
+    return group ? group.key : "waiting";
+  }
 
-    const queueList = $("#queueList");
-    if (!waiting.length) {
-      setHtml(queueList, `<div class="empty">${items.length ? "没有等待中的任务。" : "队列为空。从右侧选择 Solo Manager 项目加入。"}</div>`);
-    } else {
-      renderKeyed(queueList, waiting, renderQueueItem, (item) => item.id);
+  function renderQueue() {
+    const queue = queueOf();
+    const items = queue.items || [];
+    const buckets = { attention: [], executing: [], waiting: [], finished: [] };
+    for (const item of items) buckets[bucketOf(item)].push(item);
+    buckets.waiting.forEach((item, index) => { item.position = index + 1; });
+    const counts = {
+      attention: buckets.attention.length, executing: buckets.executing.length,
+      waiting: buckets.waiting.length, finished: buckets.finished.length,
+    };
+    counts.all = items.length;
+    for (const [key, n] of Object.entries(counts)) setText($(`#filterRow [data-n="${key}"]`), String(n));
+    $$("#filterRow button").forEach((button) => {
+      const on = button.dataset.filter === state.filter;
+      button.classList.toggle("active", on);
+      setAttr(button, "aria-selected", on ? "true" : "false");
+    });
+
+    const shown = state.filter === "all" ? ["attention", "executing", "waiting", "finished"] : [state.filter];
+    const rows = [];
+    for (const key of shown) {
+      if (!buckets[key].length) continue;
+      if (state.filter === "all") {
+        const group = GROUPS.find((g) => g.key === key);
+        rows.push({ id: `g:${key}`, group: { key, label: group.label, count: buckets[key].length } });
+      }
+      rows.push(...buckets[key]);
     }
-    const activeList = $("#activeList");
-    if (!executing.length) {
-      setHtml(activeList, `<div class="empty">没有正在执行的任务。</div>`);
+    const list = $("#queueRows");
+    if (!rows.length) {
+      const empty = {
+        all: "队列为空：打开自动补队，或从右侧手动加入项目。",
+        attention: "没有需要处理的任务。", executing: "没有正在执行的任务。",
+        waiting: "没有等待启动的任务。", finished: "没有已结束的任务。",
+      }[state.filter];
+      setHtml(list, `<div class="qempty">${esc(empty)}</div>`);
     } else {
-      renderKeyed(activeList, executing, renderQueueItem, (item) => item.id);
+      if (list.firstElementChild && list.firstElementChild.classList.contains("qempty")) list.innerHTML = "";
+      renderKeyed(list, rows, renderRow, (row) => row.id);
     }
-    const finishedList = $("#finishedList");
-    $("#finishedGroup").hidden = !finished.length;
-    if (finished.length) renderKeyed(finishedList, finished, renderQueueItem, (item) => item.id);
-    else setHtml(finishedList, "");
 
     const phases = (queue.counts || {}).phases || {};
-    const counts = queue.counts || {};
-    const waitingParts = [
-      phases.queued ? `${phases.queued} 排队` : "",
-      phases.waiting_slot ? `${phases.waiting_slot} 等名额` : "",
-      phases.retrying ? `${phases.retrying} 待重试` : "",
-      phases.starting ? `${phases.starting} 启动中` : "",
-      phases.attention ? `${phases.attention} 需处理` : "",
-    ].filter(Boolean);
-    setText($("#queueMeta"), waitingParts.join(" · ") || "无等待项");
-    setText($("#activeMeta"), executing.length ? `${executing.length} 个任务 · ${executing.reduce((n, item) => n + ((item.containers || {}).running || 0), 0)} 个容器` : "");
-    setText($("#finishedMeta"), `已结束 · ${finished.length}（${counts.done || 0} 完成 · ${counts.failed || 0} 失败 · ${counts.skipped || 0} 跳过）`);
+    setText($("#queueMeta"), state.filter === "finished"
+      ? `${(queue.counts || {}).done || 0} 完成 · ${(queue.counts || {}).failed || 0} 失败 · ${(queue.counts || {}).skipped || 0} 跳过`
+      : [phases.waiting_slot ? `${phases.waiting_slot} 等名额` : "", phases.retrying ? `${phases.retrying} 待重试` : ""].filter(Boolean).join(" · "));
+
     const paused = Boolean(queue.paused);
     setText($("#togglePausedBtn"), paused ? "启动队列" : "暂停队列");
     $("#togglePausedBtn").classList.toggle("primary", paused);
-    setText($("#queueState"), paused ? "已暂停" : "调度中");
+    const byGuard = (queue.llmGuard || {}).pausedByGuard;
+    setText($("#queueState"), paused ? (byGuard ? "大模型不可用 · 已自动暂停" : "已暂停") : "调度中");
     setAttr($("#queueState"), "data-tone", paused ? "warn" : "run");
-    const containers = state.snapshot.containers || {};
-    const disk = queue.disk || {};
-    setHtml($("#usageTiles"), [
-      ["运行容器", containers.counted ?? counts.nonTestContainerCount ?? 0],
-      ["容器上限", containers.hardLimit ?? queue.maxContainers ?? 0],
-      ["待启动候选", containers.reserved ?? counts.startupReservations ?? 0],
-      ["执行中任务", executing.length],
-      ["等待中", waiting.length],
-      ["任务并发上限", queue.maxTasks || 0],
-      ["配额已扣", counts.quotaClaimed || 0],
-      ["磁盘剩余", disk.freeGB == null ? "—" : `${Math.round(disk.freeGB)} GB`],
-    ].map(([label, value]) => `<div class="tile"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join(""));
-    const freed = disk.totalFreedBytes ? ` · 已清理 ${(disk.totalFreedBytes / 1024 ** 3).toFixed(1)} GB` : "";
-    setText($("#usageMeta"), `Docker ${containers.dockerReady ? "可用" : "不可用"}${disk.low ? ` · 磁盘不足 ${disk.minFreeGB} GB，暂停启动` : ""}${freed}`);
-    setAttr($("#usageMeta"), "data-tone", disk.low ? "warn" : "");
-    const skill = queue.skillLimit || {};
-    setText($("#limitsHint"), skill.inSync
-      ? `技能执行器已同步 · 上限 ${skill.maxContainers}`
-      : `技能执行器未同步，保存一次即可写入`);
-    setAttr($("#limitsHint"), "title", skill.path || "container-limit.json");
-    setText($("#modeMeta"), queue.scheduleMode === "containers"
-      ? `容器优先 · 上限 ${queue.maxContainers}`
-      : `任务数量优先 · 并发 ${queue.maxTasks}`);
+    $("#clearFinishedBtn").hidden = !counts.finished;
+
+    renderStrip(counts);
+    renderLegend();
     renderRefill();
     renderLlmGuard();
     renderReuse();
+    renderUsage();
     renderGuard();
+    renderLimits();
   }
+
+  /* ----------------------------------------------------------- status strip */
+  function renderStrip(counts) {
+    const snapshot = state.snapshot || {};
+    const queue = queueOf();
+    const containers = snapshot.containers || {};
+    const running = Number(containers.counted ?? containers.running ?? 0);
+    const limit = Number(containers.hardLimit ?? queue.maxContainers ?? 0);
+    const reserved = Number(containers.reserved ?? 0);
+    const disk = queue.disk || {};
+    const full = limit && running >= limit;
+    const cell = (key, value, extra = {}) => `<div class="qs"${extra.tone ? ` data-tone="${extra.tone}"` : ""}${extra.title ? ` title="${esc(extra.title)}"` : ""}>
+      <span class="qs-k">${esc(key)}</span><span class="qs-v">${value}</span>${extra.after || ""}</div>`;
+    const refill = queue.autoRefill || {};
+    const llm = queue.llmGuard || {};
+    const usage = queue.projectUsage || {};
+    const flag = (label, tone, title) => `<span class="flag" data-tone="${tone}" title="${esc(title)}">${esc(label)}</span>`;
+    setHtml($("#strip"), [
+      cell("容器", `${esc(running)}<small> / ${esc(limit)}</small>`, {
+        tone: full ? "full" : "",
+        title: [reserved ? `排队候选 ${reserved}` : "", containers.excluded ? `免计 ${containers.excluded}` : "",
+          containers.foreign ? `外部 ${containers.foreign}` : "",
+          containers.others ? `验证/其它容器 ${containers.others} 个不计（${(containers.otherNames || []).join("、")}）` : "", containers.dockerReady === false ? "Docker 不可用" : ""].filter(Boolean).join(" · ") || "运行中的候选容器 / 上限",
+        after: limit ? `<span class="meter"><i style="width:${Math.min(100, Math.round((running / limit) * 100))}%"></i></span>` : "",
+      }),
+      cell("执行中", esc(counts.executing)),
+      cell("等待", esc(counts.waiting)),
+      counts.attention ? cell("需处理", esc(counts.attention), { tone: "warn" }) : "",
+      disk.low ? cell("磁盘", `${esc(Math.round(disk.freeGB || 0))}<small> GB</small>`, { tone: "bad", title: `剩余不足 ${disk.minFreeGB} GB，已暂停启动` }) : "",
+      `<div class="qs-flags">
+        ${flag(`补队 ${refill.enabled ? "开" : "关"}`, refill.enabled ? "ok" : "", "自动补队")}
+        ${flag(llm.enabled ? (llm.pausedByGuard ? "大模型 断连" : "大模型 监测中") : "大模型 未监测", llm.pausedByGuard ? "warn" : llm.enabled ? "ok" : "", "大模型断连自动启停")}
+        ${flag(usage.enabled === false ? "质检上限 关" : usage.error ? "质检 拉取失败" : `质检上限 ${usage.limit || 10}`, usage.enabled === false ? "" : usage.error ? "warn" : "ok", usage.error || "质检次数上限")}
+      </div>`,
+    ].join(""));
+  }
+
+  $("#filterRow").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-filter]");
+    if (!button) return;
+    state.filter = button.dataset.filter;
+    try { localStorage.setItem("sologsb-queue-filter", state.filter); } catch (e) { /* ignore */ }
+    renderQueue();
+  });
 
   /* ------------------------------------------------------------------ guard */
   const GUARD_MODE_HINTS = {
     off: "不检查。",
-    observe: "只标记和记日志，不终止任何任务。被标记的项在下方列出，确认判断准确后再切到「自动终止」。",
+    observe: "只标记和记日志，不终止任何任务。确认判断准确后再切到「自动终止」。",
     enforce: "超过阈值即终止：停止任务进程、删除候选容器、加入技能停止名单、标记失败并回补配额；任务目录和轨迹保留。",
   };
 
   function renderGuard() {
-    const guard = ((state.snapshot || {}).queue || {}).guard || {};
+    const guard = queueOf().guard || {};
     const mode = guard.mode || "observe";
     setAttr($("#guardPanel"), "data-mode", mode);
     $$("#guardModeRow button").forEach((button) => {
@@ -476,9 +735,11 @@
     set("#guardLeakInput", guard.leakedProcessMinutes);
     const flags = guard.flags || [];
     const leaks = guard.leaks || [];
-    setText($("#guardMeta"), mode === "off" ? "已关闭"
-      : flags.length || leaks.length ? `${flags.length} 个任务 · ${leaks.length} 处残留` : "无异常");
-    setText($("#guardLast"), guard.lastRunAt ? `上次检查 ${fmtClock(guard.lastRunAt)} · 随纠错循环每分钟一次` : "等待首次检查");
+    const modeLabel = { off: "已关闭", observe: "仅观察", enforce: "自动终止" }[mode] || mode;
+    setText($("#guardMeta"), mode === "off" ? modeLabel
+      : flags.length || leaks.length ? `${modeLabel} · ${flags.length} 个任务 · ${leaks.length} 处残留` : `${modeLabel} · 无异常`);
+    setAttr($("#guardMeta"), "data-tone", flags.length || leaks.length ? "warn" : "");
+    setText($("#guardLast"), guard.lastRunAt ? `上次检查 ${fmtClock(guard.lastRunAt)}` : "等待首次检查");
     const pendingText = mode === "enforce" ? "下一轮检查时终止" : "开启自动终止后会终止";
     setHtml($("#guardHits"), [
       ...flags.map((flag) => `
@@ -522,66 +783,28 @@
     } catch (error) { toast(`应用失败：${error.message}`, true); }
   });
 
-  /* ------------------------------------------------------------ auto refill */
-  // The scheduler launches pending items front to back (skipping ones still
-  // in a retry backoff), and auto refill never reshuffles the first
-  // ``previewSize`` of them, so this preview is what actually starts next.
+  /* ------------------------------------------------------------ automation */
   function renderRefill() {
-    const queue = (state.snapshot || {}).queue || {};
+    const queue = queueOf();
     const refill = queue.autoRefill || {};
     const on = Boolean(refill.enabled);
     const toggle = $("#refillToggle");
     toggle.disabled = state.refillBusy;
     if (!state.refillBusy) toggle.checked = on;
-    setAttr($("#refillPanel"), "data-on", on ? "1" : "0");
-    setText($("#refillToggleText"), on ? "已开启" : "已关闭");
-    setText($("#refillPill"), `自动补队 · ${on ? "开" : "关"}`);
-    setAttr($("#refillPill"), "data-tone", on ? "run" : "idle");
-
-    const pending = (queue.items || []).filter((item) => item.status === "pending");
+    setAttr($("#refillRow"), "data-on", on ? "1" : "0");
+    const pending = (queue.items || []).filter((item) => item.status === "pending").length;
     const target = refill.targetPending || 20;
-    setHtml($("#refillState"), on
-      ? `待启动少于 <b>${esc(target)}</b> 项时，每 ${esc(refill.intervalSeconds || 60)} 秒从 Solo Manager 随机补充，禁用的项目不会补入。`
-        + (queue.paused ? `<br>队列已暂停：只补充，不启动。` : "")
-      : `不再补充新项目，只执行队列里已有的 <b>${esc(pending.length)}</b> 项。`);
+    setText($("#refillState"), on
+      ? `待启动 ${pending}/${target}，不足时每 ${refill.intervalSeconds || 60} 秒补充${queue.paused ? "（队列暂停中：只补不启动）" : ""}`
+      : `已关闭：只执行队列里已有的 ${pending} 项`);
     const last = refill.lastRun || {};
-    // The server's message carries raw per-type errors; say it short, keep the
-    // full text on hover.
     const failed = last.status === "partial" || last.status === "no-active-roots";
     const summary = last.status === "no-active-roots"
       ? last.message
-      : `补充 ${last.added || 0} 项 · 待启动 ${last.pending ?? pending.length}/${target}${last.status === "partial" ? " · 部分任务类型读取 Solo Manager 失败" : ""}`;
-    setText($("#refillLast"), on && last.at ? `上次补队 ${fmtClock(last.at)} · ${summary}` : "");
+      : `补充 ${last.added || 0} 项${last.status === "partial" ? " · 部分类型读取失败" : ""}`;
+    setText($("#refillLast"), on && last.at ? `上次 ${fmtClock(last.at)} · ${summary}` : "");
     setAttr($("#refillLast"), "title", last.message || "");
     setAttr($("#refillLast"), "data-tone", failed ? "warn" : "");
-    $("#refillLast").hidden = !(on && last.at);
-
-    const size = refill.previewSize || 10;
-    const head = pending.slice(0, size);
-    setText($("#previewMeta"), pending.length
-      ? `前 ${head.length} 项 / 共 ${pending.length} 项待启动${on ? " · 顺序不再打乱" : ""}`
-      : "");
-    const now = Date.now();
-    setHtml($("#previewList"), head.map((item, index) => {
-      const title = item.projectName || item.taskName || item.projectCode || item.id;
-      const retryAt = Date.parse(item.nextAttemptAt || "");
-      const sub = [
-        item.source === "platform" ? String(item.taskType || "Solo Manager") : "本地任务",
-        item.difficulty || "",
-        item.attempts ? `第 ${item.attempts + 1} 次尝试` : "",
-      ].filter(Boolean);
-      return `
-      <div class="item">
-        <span class="preview-n">${index + 1}</span>
-        <div class="item-main" style="flex:1 1 auto">
-          <div class="item-name"><span class="t">${esc(title)}</span>${item.projectCode && item.projectCode !== title ? `<code>${esc(item.projectCode)}</code>` : ""}</div>
-          <div class="item-sub">${sub.map(esc).join('<span class="sep">·</span>')}${retryAt > now ? `<span class="sep">·</span><span class="preview-retry">${esc(fmtClock(item.nextAttemptAt))} 后重试，先跳过</span>` : ""}</div>
-        </div>
-        <div class="item-tools">
-          <button class="btn ghost sm" data-q="disable" data-id="${esc(item.id)}" data-code="${esc(item.projectCode || "")}" ${item.projectCode ? "" : "disabled title=\"没有项目编号\""}>禁用</button>
-        </div>
-      </div>`;
-    }).join("") || `<div class="empty">没有待启动的项目。${on ? "自动补队会在下一轮补充。" : "打开自动补队，或从下方手动加入。"}</div>`);
   }
 
   $("#refillToggle").addEventListener("change", async (event) => {
@@ -599,35 +822,34 @@
     }
   });
 
-  /* -------------------------------------------------------------- llm guard */
   function renderLlmGuard() {
-    const queue = (state.snapshot || {}).queue || {};
+    const queue = queueOf();
     const guard = queue.llmGuard || {};
     const on = Boolean(guard.enabled);
     const toggle = $("#llmGuardToggle");
-    toggle.disabled = Boolean(state.llmBusy);
+    toggle.disabled = state.llmBusy;
     if (!state.llmBusy) toggle.checked = on;
-    setText($("#llmGuardText"), on ? "已开启" : "已关闭");
-    const probe = guard.lastProbe || {};
-    const next = guard.nextProbeInSeconds;
+    setAttr($("#llmRow"), "data-on", on ? "1" : "0");
+    setAttr($("#llmRow"), "data-alert", guard.pausedByGuard ? "1" : "0");
     let text;
-    if (!on) text = "已关闭：大模型中断时不会自动暂停队列。";
-    else if (guard.pausedByGuard) {
-      text = `<b>大模型不可用，队列已自动暂停。</b>每 ${esc(Math.round((guard.pausedProbeSeconds || 300) / 60))} 分钟复测一次，恢复后自动启动`
-        + (next != null ? `（约 ${esc(next)} 秒后复测）` : "") + "。";
-    } else if (queue.paused) text = "队列是手动暂停的，守护不会自动启动它；启动队列后恢复监测。";
-    else text = `监测中：每 ${esc(guard.probeSeconds || 60)} 秒探测一次，连续 ${esc(guard.failThreshold || 2)} 次失败自动暂停队列。`;
-    setHtml($("#llmState"), text);
-    const last = $("#llmLast");
-    last.hidden = !probe.at;
-    if (probe.at) {
-      setText(last, probe.ok
-        ? `上次探测 ${fmtClock(probe.at)} · 连通 · ${probe.latencyMs}ms`
-        : `上次探测 ${fmtClock(probe.at)} · 不通 · ${probe.error || "未知错误"}${guard.failures ? ` · 连续失败 ${guard.failures} 次` : ""}`);
-      setAttr(last, "data-tone", probe.ok ? "" : "warn");
-      setAttr(last, "title", probe.error || "");
+    if (!on) text = "已关闭：大模型中断时不会自动暂停";
+    else if (guard.pausedByGuard) text = "不可用，已自动暂停；恢复后自动启动";
+    else if (queue.paused) text = "队列为手动暂停，启动后恢复监测";
+    else text = `连续 ${guard.failThreshold || 2} 次失败自动暂停${guard.nextProbeAt ? ` · 下次 ${fmtClock(guard.nextProbeAt)}` : ""}`;
+    setText($("#llmState"), text);
+    const minutes = (value, fallback) => String(Math.max(1, Math.round((value || fallback) / 60)));
+    for (const [id, value] of [["#llmProbeMinutes", minutes(guard.probeSeconds, 1800)], ["#llmPausedMinutes", minutes(guard.pausedProbeSeconds, 300)]]) {
+      const input = $(id);
+      if (document.activeElement !== input && input.value !== value) input.value = value;
     }
-    setText($("#llmEndpoint"), probe.baseUrl ? `${probe.baseUrl} · ${probe.model || ""}` : (queue.anthropicBaseUrl || ""));
+    const probe = guard.lastProbe || {};
+    setText($("#llmLast"), probe.at
+      ? (probe.ok
+        ? `上次 ${fmtClock(probe.at)} 正常 · ${probe.latencyMs}ms · ${probe.replyModel || probe.model || ""}`
+        : `上次 ${fmtClock(probe.at)} 不通 · ${probe.error || "未知错误"}${guard.failures ? ` · 连续 ${guard.failures} 次` : ""}`)
+      : "");
+    setAttr($("#llmLast"), "data-tone", probe.at && !probe.ok ? "warn" : "");
+    setAttr($("#llmTestBtn"), "title", `真实请求一次容器用的大模型：${probe.baseUrl || queue.anthropicBaseUrl || ""}`);
   }
 
   $("#llmGuardToggle").addEventListener("change", async (event) => {
@@ -645,6 +867,24 @@
     }
   });
 
+  for (const [id, key, label] of [["#llmProbeMinutes", "probeMinutes", "探测间隔"], ["#llmPausedMinutes", "pausedProbeMinutes", "暂停后复测间隔"]]) {
+    $(id).addEventListener("change", async (event) => {
+      const value = Number(event.target.value);
+      if (!Number.isFinite(value) || value < 1 || value > 1440) {
+        toast(`${label}必须在 1 到 1440 分钟之间`, true);
+        renderLlmGuard();
+        return;
+      }
+      try {
+        await act("set-llm-guard-interval", { [key]: value });
+        toast(`${label}改为 ${value} 分钟`);
+      } catch (error) {
+        toast(`保存失败：${error.message}`, true);
+        renderLlmGuard();
+      }
+    });
+  }
+
   $("#llmTestBtn").addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -652,25 +892,21 @@
     try {
       const data = await act("test-llm");
       const probe = ((data.automation || {}).llmGuard || {}).lastProbe || {};
-      toast(probe.ok ? `连通正常 · ${probe.latencyMs}ms` : `连不通：${probe.error || "未知错误"}`, !probe.ok);
+      toast(probe.ok ? `连通正常 · 模型回复「${probe.reply}」 · ${probe.latencyMs}ms` : `连不通：${probe.error || "未知错误"}`, !probe.ok);
     } catch (error) {
       toast(`测试失败：${error.message}`, true);
     } finally {
       button.disabled = false;
-      setText(button, "测试容器 API 连通性");
+      setText(button, "测试");
     }
   });
 
-  /* ---------------------------------------------------------- project reuse */
   function renderReuse() {
-    const queue = (state.snapshot || {}).queue || {};
-    const on = queue.projectReuse !== false;
+    const on = queueOf().projectReuse !== false;
     const toggle = $("#reuseToggle");
     if (document.activeElement !== toggle) toggle.checked = on;
-    setText($("#reuseText"), on ? "可重用" : "不可重用");
-    setText($("#reuseHint"), on
-      ? "跑完的项目可以再次入队（手动或自动补队）；同一项目同时只会有一条待启动或运行中的记录。"
-      : "进过队列的项目（含已结束）不会再入队，补队会跳过它们。");
+    setAttr($("#reuseRow"), "data-on", on ? "1" : "0");
+    setText($("#reuseHint"), on ? "跑完的项目可以再次入队" : "进过队列的项目不再入队");
   }
 
   $("#reuseToggle").addEventListener("change", async (event) => {
@@ -683,6 +919,73 @@
       renderReuse();
     }
   });
+
+  function renderUsage() {
+    const usage = queueOf().projectUsage || {};
+    const on = usage.enabled !== false;
+    const toggle = $("#usageToggle");
+    if (document.activeElement !== toggle) toggle.checked = on;
+    setAttr($("#usageRow"), "data-on", on ? "1" : "0");
+    setAttr($("#usageRow"), "data-alert", on && usage.error ? "1" : "0");
+    const limit = $("#usageLimit");
+    if (document.activeElement !== limit && usage.limit) limit.value = usage.limit;
+    const scope = $("#usageScope");
+    if (document.activeElement !== scope && usage.scope) scope.value = usage.scope;
+    let line;
+    if (!on) line = "已关闭：不按质检次数拦截";
+    else if (usage.error) line = `拉取失败${usage.loaded ? "，沿用上次数据" : "，暂不拦截"}：${usage.error}`;
+    else if (!usage.loaded) line = "正在从质检平台拉取…";
+    else line = `已计入 ${usage.counted || 0} 次提交 · ${usage.fetchedAt ? fmtClock(usage.fetchedAt) : ""} 更新；达到上限的项目不再入队`;
+    const unparsed = (usage.unparsed || []).length;
+    setText($("#usageState"), line + (on && unparsed ? `；${unparsed} 条无项目编号未计入` : ""));
+    setAttr($("#usageState"), "data-tone", on && usage.error ? "warn" : "");
+  }
+
+  async function saveUsage(patch, message) {
+    try {
+      await act("set-project-usage", patch);
+      toast(message);
+      loadProjects(false);
+    } catch (error) {
+      toast(`保存失败：${error.message}`, true);
+      renderUsage();
+    }
+  }
+
+  $("#usageToggle").addEventListener("change", (event) => {
+    saveUsage({ enabled: event.target.checked }, event.target.checked ? "已开启质检次数上限" : "已关闭质检次数上限");
+  });
+  $("#usageLimit").addEventListener("change", (event) => {
+    saveUsage({ limit: Number(event.target.value) }, `上限改为 ${event.target.value} 次`);
+  });
+  $("#usageScope").addEventListener("change", (event) => {
+    saveUsage({ scope: event.target.value }, event.target.value === "perType" ? "0-1 与迭代分别计算" : "0-1 与迭代合计计算");
+  });
+  $("#usageRefreshBtn").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await act("refresh-project-usage", {});
+      const usage = queueOf().projectUsage || {};
+      toast(usage.error ? `刷新失败：${usage.error}` : "已刷新质检使用次数", Boolean(usage.error));
+      loadProjects(false);
+    } catch (error) {
+      toast(`刷新失败：${error.message}`, true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  function renderLimits() {
+    const queue = queueOf();
+    const skill = queue.skillLimit || {};
+    setText($("#limitsHint"), skill.inSync ? `技能已同步 · 上限 ${skill.maxContainers}` : "技能未同步，应用一次即可写入");
+    setAttr($("#limitsHint"), "title", skill.path || "container-limit.json");
+    setText($("#modeMeta"), queue.scheduleMode === "tasks"
+      ? `任务优先 · 并发 ${queue.maxTasks} · 候选 ${queue.candidatesPerTask}`
+      : `容器优先 · ${queue.maxContainers} 个 · 候选 ${queue.candidatesPerTask}`);
+    setText($("#autoMeta"), queue.paused ? "队列暂停中" : "");
+  }
 
   /* --------------------------------------------------------------- projects */
   // Same statuses the server refuses to enqueue twice (add_platform).
@@ -720,9 +1023,9 @@
         <span class="pick-dot"></span>
         <div class="item-main" style="flex:1 1 auto">
           <div class="item-name"><span class="t">${esc(item.name)}</span><code>${esc(item.code)}</code></div>
-          <div class="item-sub">${esc(item.businessDomain || "-")}<span class="sep">·</span>剩余 ${esc((item.quotaBefore || {}).remaining ?? 0)}<span class="sep">·</span>${esc(item.category || "-")}</div>
+          <div class="item-sub">${esc(item.businessDomain || "-")}<span class="sep">·</span>${esc(item.category || "-")}${item.stage === "我的项目" ? "" : `<span class="sep">·</span>${esc(item.stage || "")}`}</div>
         </div>
-        <span class="pill" data-tone="${item.stage === "我的项目" ? "ok" : "idle"}">${esc(item.stage)}</span>
+        <span style="flex:0 0 88px">${item.qcUsage && item.qcUsage.loaded ? usageCell(item.qcUsage) : `<span class="qc-none">剩余配额 ${esc((item.quotaBefore || {}).remaining ?? 0)}</span>`}</span>
       </div>`;
     }).join("") || `<div class="empty">没有匹配的项目。</div>`);
     setHtml($("#selectedHint"), state.selected
@@ -760,7 +1063,7 @@
         <div class="item-tools">
           <button class="btn sm" data-enable="${esc(item.code)}">恢复</button>
         </div>
-      </div>`).join("") || `<div class="empty" style="padding:20px">没有被禁用的项目。</div>`);
+      </div>`).join("") || `<div class="empty" style="padding:20px">没有被禁用的项目。禁用的项目不会再入队或被自动补入。</div>`);
   }
 
   $("#disabledList").addEventListener("click", async (event) => {
@@ -778,9 +1081,10 @@
     }
   });
 
+
   /* ----------------------------------------------------------------- config */
   function syncForm() {
-    const queue = (state.snapshot || {}).queue || {};
+    const queue = queueOf();
     const set = (id, value) => { const node = $(id); if (node && document.activeElement !== node) node.value = String(value ?? ""); };
     set("#maxTasksInput", queue.maxTasks);
     set("#maxContainersInput", queue.maxContainers);
@@ -798,16 +1102,23 @@
     const target = (queue.autoRefill || {}).targetPending || 20;
     const iteration = Number($("#weightInput").value || 0);
     const count = Math.round(target * iteration / 100);
-    setText($("#weightHint"), `目标待执行 ${target} 条：约 ${count} 条迭代 / ${target - count} 条 0-1 代码生成。`);
-    setText($("#refillMeta"), `迭代 ${weights["feature迭代"] ?? 80}% · 0-1 ${weights["0-1代码生成"] ?? 20}%`);
-    setText($("#headMeta"), `${(queue.items || []).length} 项 · 快照 ${fmtClock(state.snapshot.generatedAt)}`);
+    setText($("#weightHint"), `目标 ${target} 条：约 ${count} 条迭代 / ${target - count} 条 0-1。`);
+    setText($("#refillMeta"), `${weights["feature迭代"] ?? 80}:${weights["0-1代码生成"] ?? 20}`);
+    setText($("#headMeta"), `${(queue.items || []).length} 项`);
   }
 
   async function act(action, payload = {}) {
     const data = await postJson("/api/automation", { action, ...payload });
-    state.snapshot = { ...state.snapshot, queue: data.automation };
+    // The action answers with the fast snapshot, which leaves container and
+    // phase counts at zero; keep the last full numbers until the next push.
+    const previous = queueOf();
+    const fresh = data.automation || {};
+    const counts = { ...(previous.counts || {}) };
+    for (const key of ["pending", "running", "done", "failed", "skipped", "quotaClaimed", "quotaRefunded"]) {
+      if ((fresh.counts || {})[key] !== undefined) counts[key] = fresh.counts[key];
+    }
+    state.snapshot = { ...state.snapshot, queue: { ...previous, ...fresh, counts } };
     renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
-    renderMetrics(state.snapshot);
     renderQueue();
     renderDisabled();
     syncForm();
@@ -880,15 +1191,9 @@
     toast(`已禁用 ${code}`);
   }
 
-  $("#previewList").addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-q=disable]");
-    if (!button || button.disabled) return;
-    try { await disableItem(button.dataset.id, button.dataset.code); }
-    catch (error) { toast(`禁用失败：${error.message}`, true); }
-  });
-
-  $("#queueList").addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-q]");
+  // One handler for every row, whichever group or tab it is in.
+  $("#queueRows").addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-q]");
     if (!button || button.disabled) return;
     const { q, id } = button.dataset;
     try {
@@ -898,7 +1203,7 @@
         toast("已释放并发名额");
       }
       else if (q === "retry") { await act("queue-retry", { itemId: id }); toast("已重新入队"); }
-      else if (q === "remove") { await act("queue-remove", { itemId: id }); }
+      else if (q === "remove") { await act("queue-remove", { itemId: id }); toast("已删除"); }
       else if (q === "disable") await disableItem(id, button.dataset.code);
       else if (q === "prompt") {
         const data = await fetchJson(`/api/queue/${encodeURIComponent(id)}/prompt`);
@@ -910,7 +1215,7 @@
   });
 
   $("#togglePausedBtn").addEventListener("click", async () => {
-    const paused = !((state.snapshot.queue || {}).paused);
+    const paused = !queueOf().paused;
     try {
       await act("set-paused", { paused });
       toast(paused ? "队列已暂停" : "队列已启动");
@@ -929,7 +1234,7 @@
   }
   $("#modeSelect").addEventListener("change", (event) => setMode(event.target.value));
   $("#modeBadge").addEventListener("click", async () => {
-    const current = ((state.snapshot.queue || {}).scheduleMode) || "containers";
+    const current = queueOf().scheduleMode || "containers";
     await setMode(current === "containers" ? "tasks" : "containers");
   });
 
@@ -949,7 +1254,7 @@
   $("#saveWeightBtn").addEventListener("click", async () => {
     const iteration = Number($("#weightInput").value);
     if (!Number.isFinite(iteration) || iteration < 0 || iteration > 100) return toast("迭代占比必须在 0 到 100 之间", true);
-    const target = Math.max(1, Number(((state.snapshot.queue || {}).autoRefill || {}).targetPending || 20));
+    const target = Math.max(1, Number((queueOf().autoRefill || {}).targetPending || 20));
     const count = Math.round(target * iteration / 100);
     if (!window.confirm(`确认调整后续自动补队比例？\n\n迭代：${iteration}%（约 ${count} 条）\n0-1代码生成：${100 - iteration}%（约 ${target - count} 条）`)) return;
     try {
@@ -973,7 +1278,6 @@
   function applySnapshot(payload) {
     state.snapshot = payload;
     renderRail({ ...payload, connected: state.connected, error: state.error });
-    renderMetrics(payload);
     renderQueue();
     renderDisabled();
     renderProjects();
@@ -987,7 +1291,6 @@
     if (payload.containers) state.snapshot.containers = payload.containers;
     state.snapshot.generatedAt = payload.generatedAt;
     renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
-    renderMetrics(state.snapshot);
     renderQueue();
     renderProjects();
     syncForm();

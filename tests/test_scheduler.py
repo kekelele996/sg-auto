@@ -277,25 +277,31 @@ class ContainerDemandTests(SchedulerTestCase):
         self.assertEqual(in_use, 1)
         self.assertEqual(detail["estimatedNonTestContainers"], 2)
 
-    def test_containers_from_other_tools_count_against_the_limit(self):
+    def test_only_candidate_containers_count_against_the_limit(self):
+        """The limit is the key's: verification servers and databases never count."""
         config = make_config(self.root)
         config["automation"]["excludedProjectCodes"] = ["ld427"]
         queue = build_queue(config, docker=fake_docker([
-            {"name": "cy180-web-1", "state": "running"},
-            {"name": "friendly_keller", "state": "running"},
-            {"name": "ld427-db", "state": "running"},
-            {"name": "renovation-api", "state": "exited"},
+            {"name": "sologsb-gb-1-20260925-010101-abc-candidate-1-1790000000-a1", "state": "running"},
+            {"name": "friendly_keller", "state": "running", "image": "adminfather/benzhi-claude-code:v2"},
+            {"name": "ld427-runner", "state": "running", "image": "adminfather/benzhi-claude-code:v2"},
+            {"name": "gb-133-db", "state": "running", "image": "gb-133-db-image"},
+            {"name": "gb62-verify-mongo-a", "state": "running", "image": "mongo:6"},
+            {"name": "renovation-api", "state": "exited", "image": "adminfather/benzhi-claude-code:v2"},
         ]))
         with queue._lock:
             _tasks, detail = queue._capacity_usage_locked(queue._startup_timeout())
-        self.assertEqual(detail["foreignContainers"], ["cy180-web-1", "friendly_keller"])
+        self.assertEqual(detail["foreignContainers"], ["friendly_keller"])
         self.assertEqual(detail["nonTestContainerCount"], 2)
-        self.assertEqual(detail["estimatedNonTestContainers"], 2)
+        summary = queue.container_usage()
+        self.assertEqual(summary["others"], 2)
+        self.assertEqual(summary["otherNames"], ["gb-133-db", "gb62-verify-mongo-a"])
+        self.assertEqual(summary["counted"], 2)
 
-    def test_skill_is_told_to_count_every_container(self):
+    def test_skill_is_told_to_count_candidates_only(self):
         queue = build_queue(make_config(self.root))
         queue.sync_skill_limits()
-        self.assertTrue(json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["countAllContainers"])
+        self.assertFalse(json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["countAllContainers"])
 
 
 class PhantomDemandTests(SchedulerTestCase):

@@ -55,14 +55,14 @@
               <div class="field"><label for="usernameInput">用户名</label><input class="input" id="usernameInput" placeholder="Solo Manager 用户名" autocomplete="username"></div>
               <div class="field">
                 <label for="passwordInput">密码</label>
-                <input class="input" id="passwordInput" type="password" placeholder="留空表示不修改" autocomplete="new-password">
+                <input class="input" id="passwordInput" type="password" placeholder="留空沿用已保存的密码" autocomplete="new-password">
                 <span class="hint" id="passwordHint">密码只写入 macOS Keychain，不落盘到任何配置文件。</span>
               </div>
               <div class="note" id="connectionNotice" hidden></div>
             </div>
             <div class="panel-foot">
               <button class="btn primary" id="saveManagerBtn" type="button">保存并测试连接</button>
-              <button class="btn" id="testConnectionBtn" type="button">仅测试</button>
+              <button class="btn" id="testConnectionBtn" type="button">测试登录</button>
             </div>
           </div>
 
@@ -174,9 +174,7 @@
       $("#baseUrlInput").value = data.platform.managerBaseUrl || manager.baseUrl || "";
       $("#usernameInput").value = data.platform.username || manager.username || "";
       $("#passwordInput").value = "";
-      setText($("#passwordHint"), manager.passwordSaved
-        ? "Keychain 中已保存密码；留空表示不修改。"
-        : "Keychain 中尚未保存密码；留空表示不修改。");
+      passwordHint(manager.passwordSaved);
       if (!state.selectedFolder) state.selectedFolder = settings.defaultFolderId || "";
       renderFolders();
     } catch (error) {
@@ -197,32 +195,74 @@
 
   function showConnection(connection) {
     const notice = $("#connectionNotice");
+    const login = connection.login || {};
+    const token = connection.token;
+    const user = connection.username || $("#usernameInput").value || "";
+    const lines = [];
+    lines.push(login.ok
+      ? `✓ 密码登录成功：${user}${login.role ? `（${login.role}）` : ""} @ ${connection.baseUrl || ""}`
+      : `✗ ${connection.error || login.error || "未知原因"}`);
+    if (token) {
+      lines.push(token.ok
+        ? `✓ 调度令牌有效${token.username ? `：${token.username}` : ""}`
+        : `✗ 调度令牌：${token.error || "与配置的用户不一致"}`);
+    }
+    if (connection.warning) lines.push(`! ${connection.warning}`);
     notice.hidden = false;
-    notice.className = connection.ok ? "note ok" : "note bad";
-    setText(notice, connection.ok
-      ? `连接正常：${connection.baseUrl}${connection.warning ? `（${connection.warning}）` : ""}`
-      : `连接失败：${connection.error || "未知原因"}`);
-    setText($("#connectionMeta"), connection.ok ? "已连接" : "未连接");
+    notice.className = login.ok && (!token || token.ok) ? "note ok" : "note bad";
+    notice.style.whiteSpace = "pre-line";
+    setText(notice, lines.join("\n"));
+    setText($("#connectionMeta"), login.ok ? `已登录 · ${user}` : "登录失败");
+  }
+
+  function passwordHint(saved) {
+    setText($("#passwordHint"), saved
+      ? "✓ Keychain 已保存密码；留空表示沿用。"
+      : "Keychain 尚未保存密码，请填写后保存。");
+  }
+
+  function managerForm() {
+    return {
+      managerBaseUrl: $("#baseUrlInput").value,
+      username: $("#usernameInput").value,
+      password: $("#passwordInput").value,
+    };
   }
 
   $("#saveManagerBtn").addEventListener("click", async () => {
+    const button = $("#saveManagerBtn");
+    button.disabled = true;
+    setText($("#connectionMeta"), "登录验证中…");
     try {
-      const result = await postJson("/api/settings/manager", {
-        managerBaseUrl: $("#baseUrlInput").value,
-        username: $("#usernameInput").value,
-        password: $("#passwordInput").value,
-      }, 30000);
+      const result = await postJson("/api/settings/manager", managerForm(), 30000);
       $("#passwordInput").value = "";
       showConnection(result.connection || {});
-      setText($("#passwordHint"), result.passwordSaved ? "Keychain 中已保存密码；留空表示不修改。" : "密码未改动。");
-      toast(result.passwordSaved ? "Solo Manager 设置已保存（密码已写入 Keychain）" : "Solo Manager 设置已保存");
+      passwordHint(result.passwordSaved);
+      toast((result.connection || {}).ok ? "已保存，登录验证通过" : "已保存，但登录验证未通过", !(result.connection || {}).ok);
       await loadFolders();
     } catch (error) {
-      toast(`保存失败：${error.message}`, true);
+      showConnection({ ok: false, error: error.message });
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
     }
   });
 
-  $("#testConnectionBtn").addEventListener("click", checkConnection);
+  // Tests exactly what is in the form (blank password = the saved one); nothing is saved.
+  async function testLogin() {
+    setText($("#connectionMeta"), "登录验证中…");
+    try {
+      const form = managerForm();
+      const data = form.password
+        ? await postJson("/api/settings/manager/test", form, 30000)
+        : await fetchJson("/api/settings/connection", {}, 30000);
+      showConnection(data.connection || {});
+    } catch (error) {
+      showConnection({ ok: false, error: error.message });
+    }
+  }
+
+  $("#testConnectionBtn").addEventListener("click", testLogin);
 
   $("#saveFolderBtn").addEventListener("click", async () => {
     const picked = $$('input[name="folder"]').find((node) => node.checked);

@@ -61,6 +61,17 @@ class LlmGuardTests(SchedulerTestCase):
         self.assertEqual([name for name, _ in events if name in {"llm_guard.paused", "llm_guard.resumed"}],
                          ["llm_guard.paused", "llm_guard.resumed"])
 
+    def test_default_probe_interval_is_thirty_minutes(self):
+        guard, _clock, _events = _guard({"automation": {}}, [])
+        self.assertEqual(guard.settings()["probeSeconds"], 1800)
+
+    def test_intervals_are_validated_and_applied(self):
+        guard, _clock, _events = _guard(self.config, [])
+        with self.assertRaises(ValueError):
+            guard.set_intervals(probe_seconds=10)
+        settings = guard.set_intervals(probe_seconds=2700, paused_probe_seconds=600)
+        self.assertEqual((settings["probeSeconds"], settings["pausedProbeSeconds"]), (2700, 600))
+
     def test_manual_pause_is_never_lifted(self):
         self.config["automation"]["paused"] = True
         guard, clock, _ = _guard(self.config, [True])
@@ -111,7 +122,81 @@ class LlmGuardActionTests(SchedulerTestCase):
         self.assertTrue(snapshot["llmGuard"]["lastProbe"]["ok"])
         self.assertEqual(snapshot["llmGuard"]["lastProbe"]["latencyMs"], 7)
 
+    def test_interval_action_validates_and_persists(self):
+        from api.common import MonitorError
+        for bad in (0, 2000, "x"):
+            with self.assertRaises(MonitorError):
+                self.service.automation_action("set-llm-guard-interval", {"probeMinutes": bad})
+        snapshot = self.service.automation_action("set-llm-guard-interval", {"probeMinutes": 45})
+        self.assertEqual(snapshot["llmGuard"]["probeSeconds"], 2700)
+        saved = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["automation"]["llmGuard"]["probeSeconds"], 2700)
+
     def test_manual_start_clears_the_guard_pause(self):
         self.config["automation"]["llmGuard"] = {"pausedByGuard": True}
         self.service.automation_action("set-paused", {"paused": False})
         self.assertFalse(self.service.llm_guard.settings()["pausedByGuard"])
+
+
+class ProbeResponseTests(SchedulerTestCase):
+    """probe_llm only passes when the model actually answers with text."""
+
+    ENDPOINT = {"baseUrl": "https://llm.example", "key": "secret-key", "model": "m"}
+
+    def _probe(self, body: str):
+        from unittest import mock
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return body.encode("utf-8")
+
+        with mock.patch("api.llm_guard.urllib.request.urlopen", return_value=Response()):
+            return probe_llm(self.ENDPOINT, 5)
+
+    def test_real_text_reply_passes_and_is_reported(self):
+        result = self._probe(json.dumps({
+            "type": "message", "model": "auto_model/urm", "stop_reason": "end_turn",
+            "usage": {"output_tokens": 26},
+            "content": [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "OK"}],
+        }))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reply"], "OK")
+        self.assertEqual(result["replyModel"], "auto_model/urm")
+        self.assertEqual(result["outputTokens"], 26)
+
+    def test_200_without_text_fails(self):
+        result = self._probe(json.dumps({"type": "message", "content": [{"type": "thinking", "thinking": "x"}],
+                                         "stop_reason": "max_tokens"}))
+        self.assertFalse(result["ok"])
+        self.assertIn("没有返回文本", result["error"])
+
+    def test_200_with_non_json_body_fails(self):
+        result = self._probe("<html>502 Bad Gateway</html>")
+        self.assertFalse(result["ok"])
+        self.assertIn("不是 JSON", result["error"])
+
+    def test_error_body_fails(self):
+        result = self._probe(json.dumps({"type": "error", "error": {"message": "overloaded"}}))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "overloaded")
+
+
+class StatusStabilityTests(SchedulerTestCase):
+    def test_status_does_not_change_as_time_passes(self):
+        # The snapshot hub pushes the page whenever the queue payload changes;
+        # a ticking countdown here re-rendered the page every build.
+        self.config["automation"]["paused"] = False
+        guard, clock, _ = _guard(self.config, [True])
+        guard.step()
+        before = guard.status()
+        clock.now += 7
+        self.assertEqual(guard.status(), before)
+        self.assertTrue(before["nextProbeAt"])
