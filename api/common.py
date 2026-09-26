@@ -124,9 +124,9 @@ DEFAULT_AUTO_TRIGGER_PROMPT = (
     "- Solo Manager 必须使用 {{manager_username}} 对应的有效登录态；当前登录态不是 {{manager_username}} 时立即停止。\n"
     "- Claude Code Key 从钥匙串 `benzhi-claude-code-gaobo-pi-a453493f` 读取，通过 `SOLOSB_CLAUDE_KEY` 注入；"
     "禁止把明文 Key 写入任务目录、状态文件、轨迹或日志。\n"
-    "- 单 Key 全局硬上限为 {{max_containers}} 个候选容器，按“{{max_tasks}} 个任务、每个任务 "
-    "{{candidates_per_task}} 个候选”共享名额；预计当前数量加本批候选数超过 {{max_containers}} 时等待。\n"
-    "- 当前调度模式：{{schedule_mode}}。\n\n"
+    "- 容器名额不写死：由调度监控台动态管理（`~/.codex/sologsb-0917/container-limit.json`，弹性扩缩容时随时变化），"
+    "技能的容器限流器每次启动容器前自动读取并排队。不要自行设定、记录或核对容器上限；上限变化（包括高于以往的数值）属正常，"
+    "不得据此判定超限或停止任务。当前调度模式：{{schedule_mode}}。\n\n"
     "项目接入：\n"
     "- 已选定项目：`{{selected_project}}`。\n"
     "- 非空时必须使用其中的 projectCode 或 projectId 接入，不得静默换题；无法按要求接入时立即停止。\n"
@@ -245,6 +245,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "monitor": {
         "pollSeconds": 3,
         "dockerCacheSeconds": 2,
+        # ``docker ps`` takes 15-25 s when the daemon is busy.
+        "dockerTimeoutSeconds": 20,
+        "dockerErrorCacheSeconds": 5,
         "snapshotCacheSeconds": 1,
         "parseTraceOnSnapshot": False,
         "traceMaxBytes": 1 * 1024 * 1024,

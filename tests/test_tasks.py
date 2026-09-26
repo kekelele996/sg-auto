@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -136,6 +138,71 @@ class DockerListingFallbackTests(unittest.TestCase):
             data = DockerCache(ttl=0).get()
         self.assertIn("rw layer snapshot not found", str(data.get("error") or ""))
         self.assertFalse(data.get("fetchedOk"))
+
+
+class DockerListingTimeoutTests(unittest.TestCase):
+    """A slow daemon must not multiply ``docker ps`` runs or blank the listing."""
+
+    @staticmethod
+    def _listing(*names: str) -> subprocess.CompletedProcess:
+        stdout = "".join(json.dumps({"ID": name, "Names": name, "State": "running"}) + "\n" for name in names)
+        return subprocess.CompletedProcess(["docker", "ps"], 0, stdout, "")
+
+    def test_timeout_is_configurable(self):
+        seen: list[float] = []
+
+        def fake_run(_args, **kwargs):
+            seen.append(kwargs["timeout"])
+            return self._listing("cand-1")
+
+        with mock.patch("api.tasks.subprocess.run", side_effect=fake_run):
+            DockerCache(ttl=0, timeout=20).get()
+        self.assertEqual(seen, [20.0])
+
+    def test_a_failure_keeps_the_last_listing_and_is_cached_briefly(self):
+        docker = DockerCache(ttl=0, error_ttl=60)
+        with mock.patch("api.tasks.subprocess.run", return_value=self._listing("cand-1", "cand-2")):
+            docker.get()
+        timeout = subprocess.TimeoutExpired(["docker", "ps"], 20)
+        with mock.patch("api.tasks.subprocess.run", side_effect=timeout) as run:
+            first = docker.get()
+            second = docker.get()
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(first["stale"])
+        self.assertIn("timed out", first["error"])
+        self.assertEqual([item["name"] for item in second["items"]], ["cand-1", "cand-2"])
+        self.assertIsNotNone(first["staleSeconds"])
+        # ``force`` still asks Docker again.
+        with mock.patch("api.tasks.subprocess.run", return_value=self._listing("cand-3")):
+            self.assertEqual([item["name"] for item in docker.get(force=True)["items"]], ["cand-3"])
+
+    def test_concurrent_callers_share_one_listing(self):
+        docker = DockerCache(ttl=0)
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[int] = []
+
+        def slow_run(_args, **_kwargs):
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            return self._listing("cand-1")
+
+        results: list[dict] = []
+        with mock.patch("api.tasks.subprocess.run", side_effect=slow_run):
+            first = threading.Thread(target=lambda: results.append(docker.get()))
+            first.start()
+            self.assertTrue(started.wait(5))
+            waiters = [threading.Thread(target=lambda: results.append(docker.get())) for _ in range(3)]
+            for thread in waiters:
+                thread.start()
+            time.sleep(0.2)  # let the waiters queue up behind the running listing
+            release.set()
+            for thread in [first, *waiters]:
+                thread.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(result["items"][0]["name"] == "cand-1" for result in results))
 
 
 class SnapshotTests(SchedulerTestCase):

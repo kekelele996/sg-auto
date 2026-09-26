@@ -301,8 +301,10 @@
                   <option value="tasks">任务数量优先 · 保持并行任务数等于上限</option>
                 </select>
               </div>
-              <div class="field"><label for="maxContainersInput">最大容器数</label><input class="input" id="maxContainersInput" type="number" min="1" max="6">
-                <span class="hint">与技能共用，硬顶 6。</span></div>
+              <div class="field"><label for="maxContainersInput">最大容器数</label><input class="input" id="maxContainersInput" type="number" min="1" max="8">
+                <span class="hint">与技能共用，硬顶 8；开弹性时为保底值。</span></div>
+              <div class="field"><label for="elasticCeilingInput">弹性上限</label><input class="input" id="elasticCeilingInput" type="number" min="1" max="8">
+                <span class="hint"><label><input type="checkbox" id="elasticToggle"> 弹性扩容</label>：容器满且 30 分钟无 429 时每 10 分钟 +1，候选收到 429 超限立即 −1，不低于保底。</span></div>
               <div class="field"><label for="candidatesInput">单任务候选数</label><input class="input" id="candidatesInput" type="number" min="2" max="8">
                 <span class="hint">2–8。</span></div>
               <div class="field"><label for="maxTasksInput">最大任务数</label><input class="input" id="maxTasksInput" type="number" min="1" max="20">
@@ -687,11 +689,13 @@
     const usage = queue.projectUsage || {};
     const flag = (label, tone, title) => `<span class="flag" data-tone="${tone}" title="${esc(title)}">${esc(label)}</span>`;
     setHtml($("#strip"), [
-      cell("容器", `${esc(running)}<small> / ${esc(limit)}</small>`, {
+      cell("容器", `${esc(running)}<small> / ${esc(limit)}${containers.stale ? " · 快照" : ""}</small>`, {
         tone: full ? "full" : "",
         title: [reserved ? `排队候选 ${reserved}` : "", containers.excluded ? `免计 ${containers.excluded}` : "",
           containers.foreign ? `外部 ${containers.foreign}` : "",
-          containers.others ? `验证/其它容器 ${containers.others} 个不计（${(containers.otherNames || []).join("、")}）` : "", containers.dockerReady === false ? "Docker 不可用" : ""].filter(Boolean).join(" · ") || "运行中的候选容器 / 上限",
+          containers.others ? `验证/其它容器 ${containers.others} 个不计（${(containers.otherNames || []).join("、")}）` : "", containers.dockerReady === false ? (containers.stale
+            ? `Docker 响应慢，显示${Number(containers.staleSeconds) > 0 ? ` ${Math.round(Number(containers.staleSeconds))} 秒前的` : "上次"}快照`
+            : "Docker 不可用") : ""].filter(Boolean).join(" · ") || "运行中的候选容器 / 上限",
         after: limit ? `<span class="meter"><i style="width:${Math.min(100, Math.round((running / limit) * 100))}%"></i></span>` : "",
       }),
       cell("执行中", esc(counts.executing)),
@@ -1015,9 +1019,14 @@
     const skill = queue.skillLimit || {};
     setText($("#limitsHint"), skill.inSync ? `技能已同步 · 上限 ${skill.maxContainers}` : "技能未同步，应用一次即可写入");
     setAttr($("#limitsHint"), "title", skill.path || "container-limit.json");
+    const elastic = queue.elastic || {};
+    const pinned = elastic.pinnedByPrompt
+      ? ` · ${elastic.pinnedTasks} 个任务的提示词写死了上限，暂不超过 ${elastic.pinnedByPrompt}` : "";
     setText($("#modeMeta"), queue.scheduleMode === "tasks"
       ? `任务优先 · 并发 ${queue.maxTasks} · 候选 ${queue.candidatesPerTask}`
-      : `容器优先 · ${queue.maxContainers} 个 · 候选 ${queue.candidatesPerTask}`);
+      : elastic.enabled
+        ? `容器优先 · 弹性 ${elastic.current}（${elastic.floor}–${elastic.ceiling}）个 · 候选 ${queue.candidatesPerTask}${elastic.recentRateLimits ? ` · 近 5 分钟 429 ×${elastic.recentRateLimits}（等待 ${elastic.stallPercentNow}%）` : ""}${elastic.learnedForHour ? ` · 本时段学到 ${elastic.learnedForHour}` : ""}${pinned}`
+        : `容器优先 · ${queue.maxContainers} 个 · 候选 ${queue.candidatesPerTask}${pinned}`);
     setText($("#autoMeta"), queue.paused ? "队列暂停中" : "");
   }
 
@@ -1124,6 +1133,9 @@
     set("#maxContainersInput", queue.maxContainers);
     set("#candidatesInput", queue.candidatesPerTask);
     set("#cooldownInput", queue.cooldownSeconds);
+    set("#elasticCeilingInput", (queue.elastic || {}).ceiling);
+    const toggle = $("#elasticToggle");
+    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean((queue.elastic || {}).enabled);
     const weights = (queue.autoRefill || {}).taskTypeWeights || {};
     set("#weightInput", weights["feature迭代"] ?? 80);
     const mode = $("#modeSelect");
@@ -1279,6 +1291,10 @@
         maxContainers: Number($("#maxContainersInput").value),
         candidatesPerTask: Number($("#candidatesInput").value),
         cooldownSeconds: Number($("#cooldownInput").value),
+        elasticContainers: {
+          enabled: $("#elasticToggle").checked,
+          ceiling: Number($("#elasticCeilingInput").value),
+        },
       });
       toast("上限参数已应用");
     } catch (error) { toast(`应用失败：${error.message}`, true); }

@@ -158,6 +158,34 @@ class ContainerGateTests(SchedulerTestCase):
             for index in range(1, count + 1)
         ]
 
+    def test_empty_containers_skip_the_configured_interval(self):
+        """Containers first: 4 empty containers must not wait out 2 × 210 s."""
+        queue = self._queue(self._running(2), maxContainers=6, candidatesPerTask=2, cooldownSeconds=210)
+        queue._lastStartedAt = iso_from_timestamp(time.time() - 30)
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertEqual(str(item.get("containerWait") or ""), "")
+
+    def test_interval_still_paces_the_last_batch(self):
+        queue = self._queue(self._running(5), maxContainers=6, candidatesPerTask=2, cooldownSeconds=210)
+        queue._lastStartedAt = iso_from_timestamp(time.time() - 30)
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertIn("启动间隔 210 秒", str(item.get("containerWait") or ""))
+
+    def test_minimum_spacing_holds_even_with_empty_containers(self):
+        queue = self._queue([], maxContainers=6, candidatesPerTask=2, cooldownSeconds=210)
+        queue._lastStartedAt = utc_now()
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertIn("启动间隔 210 秒", str(item.get("containerWait") or ""))
+
     def test_one_free_slot_is_enough_to_start(self):
         """The executor queues overflow, so the monitor need not fit the batch.
 
@@ -210,15 +238,140 @@ class ContainerGateTests(SchedulerTestCase):
         self.assertEqual(str(tail.get("containerWait") or ""), "")
         self.assertEqual(str(tail.get("containerWaitKind") or ""), "")
 
-    def test_container_mode_ignores_the_task_cap(self):
-        """Tasks past the candidate race hold no container; they must not
-        keep the container slots empty just because ``capacity`` is reached."""
+    def test_container_mode_ignores_the_task_mode_capacity(self):
+        """``capacity`` is the tasks-mode knob; container mode has its own cap."""
         queue = self._queue(self._running(2), maxContainers=4, candidatesPerTask=2, capacity=1)
         item = platform_item()
         queue._items = [item]
         queue._save()
         tick_with_ready_runner(queue, self.root)
         self.assertEqual(str(item.get("containerWait") or ""), "")
+
+    def _live(self, name, state, **overrides):
+        root_dir = self.root / "tasks" / name
+        (root_dir / "monitor").mkdir(parents=True, exist_ok=True)
+        (root_dir / "monitor" / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        return platform_item(id=f"platform-{name}", projectCode=name.split("-2026")[0], status="triggered",
+                             capacityHeld=True, taskRoot=str(root_dir), startedAt=utc_now(), **overrides)
+
+    def test_container_mode_caps_tasks_before_the_race_ends(self):
+        """20 tasks on five containers made each one slower than on the other machines."""
+        preparing = {"status": "prepared", "candidates": {}}
+        live = [self._live(f"gb-{n}-20260920-120000-abc", preparing) for n in (11, 12)]
+        queue = self._queue([], maxContainers=8, candidatesPerTask=2, maxActiveTasks=2)
+        waiting = platform_item(id="platform-wait")
+        queue._items = [*live, waiting]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertIn("候选阶段任务已满：2/2", str(waiting.get("containerWait") or ""))
+        self.assertEqual(waiting["status"], "pending")
+
+    def test_tasks_past_the_race_have_their_own_cap(self):
+        """Review and recording hold no container: 6 of 8 such tasks left the containers empty."""
+        finished = {"status": "running", "candidateRaceFinishedAt": "2026-09-20T00:00:00Z",
+                    "candidates": {"candidate-1": {"status": "staged"}}}
+        live = [self._live(f"gb-{n}-20260920-120000-abc", finished) for n in (11, 12, 13)]
+        queue = self._queue([], maxContainers=4, candidatesPerTask=2, maxActiveTasks=2,
+                            maxPostCandidateTasks=3)
+        waiting = platform_item(id="platform-wait")
+        queue._items = [*live, waiting]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertIn("已过候选赛的任务已满：3/3", str(waiting.get("containerWait") or ""))
+        self.assertNotIn("候选阶段任务已满", str(waiting.get("containerWait") or ""))
+        self.assertEqual(waiting["status"], "pending")
+        queue.config["automation"]["maxPostCandidateTasks"] = 4
+        _, detail = queue._capacity_usage_locked(queue._startup_timeout())
+        self.assertEqual(len(detail["postCandidateJobKeys"]), 3)
+        self.assertEqual(queue._max_post_candidate_tasks(), 4)
+
+    def test_active_task_cap_defaults_from_the_container_limit(self):
+        queue = self._queue([], maxContainers=5, candidatesPerTask=2)
+        # Tasks hold containers only during the race, about half their life.
+        self.assertEqual(queue._max_active_tasks(), 7)
+        queue.config["automation"]["maxActiveTasks"] = 999
+        self.assertEqual(queue._max_active_tasks(), 50)
+
+    def test_no_launch_while_candidates_wait_for_containers(self):
+        """A new task would only split the slots the queued candidates need."""
+        name = "gb-13-20260920-120000-abc"
+        live = self._live(name, {"status": "candidates_running", "candidates": {
+            "candidate-1": {"status": "running"}, "candidate-2": {"status": "running"},
+        }})
+        queue = self._queue([{"name": f"sologsb-{name}-candidate-1-1790000000-abc", "state": "running"}],
+                            maxContainers=4, candidatesPerTask=2)
+        waiting = platform_item(id="platform-wait")
+        queue._items = [live, waiting]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertIn("1 个候选在排队等容器", str(waiting.get("containerWait") or ""))
+        self.assertEqual(waiting.get("containerWaitKind"), "capacity")
+        self.assertEqual(waiting["status"], "pending")
+
+    def test_initialising_task_does_not_block_the_next_launch(self):
+        """Setup takes ~10 minutes; waiting it out left three of five slots empty."""
+        initialising = platform_item(id="platform-init", status="running", capacityHeld=True,
+                                     startedAt=utc_now())
+        queue = self._queue([], maxContainers=5, candidatesPerTask=2)
+        waiting = platform_item(id="platform-wait", projectCode="gb-2")
+        queue._items = [initialising, waiting]
+        queue._save()
+        with queue._lock:
+            detail = queue._capacity_usage_locked(queue._startup_timeout())[1]
+        self.assertEqual(detail["pendingContainerDemand"], 2)
+        self.assertEqual(detail["queuedCandidates"], 0)
+        tick_with_ready_runner(queue, self.root)
+        self.assertNotIn("排队等容器", str(waiting.get("containerWait") or ""))
+
+    def test_granted_reservation_takes_the_room(self):
+        """A reservation marker is a slot the skill has already handed out."""
+        name = "gb-14-20260920-120000-abc"
+        live = self._live(name, {"status": "candidates_running", "candidates": {
+            "candidate-1": {"status": "running"}, "candidate-2": {"status": "running"},
+        }})
+        queue = self._queue(self._running(3), maxContainers=4, candidatesPerTask=2)
+        queue._items = [live]
+        queue.slots.reserve(container=f"sologsb-{name}-candidate-1-x", project_code="gb-14", item_id="other")
+        with queue._lock:
+            detail = queue._capacity_usage_locked(queue._startup_timeout())[1]
+        self.assertEqual(detail["grantedSlots"], 1)
+        queue._starved_since.pop(name, None)
+        with queue._lock:
+            queue._capacity_usage_locked(queue._startup_timeout())
+        # No room, so the queued candidates are waiting, not starving.
+        self.assertNotIn(name, queue._starved_since)
+
+    def test_skill_limit_drift_is_corrected_and_holds_launches(self):
+        queue = self._queue([], maxContainers=4, candidatesPerTask=2)
+        events = []
+        queue.log = type("L", (), {"emit": lambda _s, event, **_k: events.append(event)})()
+        atomic_write_json(queue.slots.limit_path, {"maxContainers": 6, "managedBy": "someone-else"})
+        item = platform_item()
+        queue._items = [item]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        self.assertTrue(queue.skill_limit_status()["inSync"])
+        self.assertEqual(item.get("containerWaitKind"), "gate")
+        self.assertIn("技能侧容器上限", str(item.get("containerWait") or ""))
+        tick_with_ready_runner(queue, self.root)
+        self.assertEqual(events.count("config.skill_limit_drift"), 1)
+        self.assertEqual(item["status"], "pending")
+        # Once executors have reread the file, launches resume.
+        queue._skill_limit_resynced_at -= 181
+        tick_with_ready_runner(queue, self.root)
+        self.assertNotEqual(item.get("containerWaitKind"), "gate", item.get("containerWait"))
+
+    def test_oversubscription_is_logged_once(self):
+        preparing = {"status": "prepared", "candidates": {}}
+        live = [self._live(f"gb-{n}-20260920-120000-abc", preparing) for n in (21, 22, 23)]
+        queue = self._queue([], maxContainers=4, candidatesPerTask=2, maxActiveTasks=2)
+        events = []
+        queue.log = type("L", (), {"emit": lambda _s, event, **_k: events.append(event)})()
+        queue._items = [*live, platform_item(id="platform-wait")]
+        queue._save()
+        tick_with_ready_runner(queue, self.root)
+        tick_with_ready_runner(queue, self.root)
+        self.assertEqual(events.count("queue.oversubscribed"), 1)
 
     def test_task_mode_gates_on_live_tasks(self):
         queue = self._queue([], scheduleMode="tasks", capacity=1)
@@ -316,6 +469,29 @@ class ContainerDemandTests(SchedulerTestCase):
         self.assertEqual(summary["otherNames"], ["gb-133-db", "gb62-verify-mongo-a"])
         self.assertEqual(summary["counted"], 2)
 
+    def test_a_timed_out_listing_shows_the_last_snapshot_not_zero(self):
+        """``docker ps`` timing out under load read "0 / 5" with five candidates up."""
+        config = make_config(self.root)
+        docker = fake_docker([
+            {"name": "sologsb-gb-1-20260925-010101-abc-candidate-1-1790000000-a1", "state": "running"},
+            {"name": "sologsb-gb-1-20260925-010101-abc-candidate-2-1790000000-a2", "state": "running"},
+            {"name": "gb-133-db", "state": "running", "image": "gb-133-db-image"},
+        ])
+        docker._data.update(error="Docker 不可用：timed out after 20 seconds", stale=True, staleSeconds=12.0)
+        docker._data.pop("fetchedOk")
+        queue = build_queue(config, docker=docker)
+        with queue._lock:
+            _tasks, detail = queue._capacity_usage_locked(queue._startup_timeout())
+        # The gate still refuses to trust the listing.
+        self.assertFalse(detail["dockerReady"])
+        self.assertEqual(detail["nonTestContainerCount"], 0)
+        summary = queue.container_usage()
+        self.assertEqual(summary["counted"], 2)
+        self.assertEqual(summary["groups"], ["gb-1-20260925-010101-abc"])
+        self.assertTrue(summary["stale"])
+        self.assertEqual(summary["staleSeconds"], 12.0)
+        self.assertFalse(summary["dockerReady"])
+
     def test_skill_is_told_to_count_candidates_only(self):
         queue = build_queue(make_config(self.root))
         queue.sync_skill_limits()
@@ -385,6 +561,24 @@ class PhantomDemandTests(SchedulerTestCase):
         detail = self._detail(queue)
         self.assertEqual(detail["pendingContainerDemand"], 2)
         self.assertEqual(detail["phantomDemand"], [])
+
+    def test_starved_demand_of_a_live_executor_still_counts(self):
+        """Losing the limiter's race is not death: the executor will get a slot."""
+        state_path = Path(self.item["taskRoot"]) / "monitor" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for record in state["candidates"].values():
+            record["runPid"] = os.getpid()
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        queue = self._queue(running=1)
+        self._detail(queue)
+        queue._starved_since[self.NAME] -= 601
+        detail = self._detail(queue)
+        self.assertEqual(detail["pendingContainerDemand"], 2)
+        self.assertEqual(detail["phantomDemand"], [])
+        self.assertEqual(detail["starvedDemand"], [self.NAME])
+        self._detail(queue)
+        self.assertEqual(self.events.count("queue.candidate_starved"), 1)
+        self.assertEqual(self.events.count("queue.phantom_demand"), 0)
 
     def test_threshold_is_configurable_and_clamped(self):
         queue = self._queue(running=1)
@@ -1171,6 +1365,270 @@ class TerminalIdempotencyTests(SchedulerTestCase):
         self.assertEqual(item["quota"]["history"][0]["platformTaskId"], "t-7")
 
 
+class OutcomeTests(SchedulerTestCase):
+    """Finished tasks leave a record of where their time went."""
+
+    def _task(self, name, status, **state_fields):
+        task_root = write_task(self.root, name, status=status)
+        state_path = task_root / "monitor" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.update(state_fields)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        old = time.time() - 60
+        os.utime(state_path, (old, old))
+        return task_root
+
+    def test_done_task_records_phase_durations(self):
+        task_root = self._task(
+            "gb-31-20260920-120000-abc", "verified",
+            createdAt="2026-09-20T00:00:00Z",
+            candidateRaceStartedAt="2026-09-20T00:10:00Z",
+            candidateRaceFinishedAt="2026-09-20T01:10:00Z",
+            gsbExportedAt="2026-09-20T01:30:00Z",
+        )
+        queue = build_queue(make_config(self.root))
+        events = []
+        queue.log = type("L", (), {"emit": lambda _s, event, **_k: events.append(event)})()
+        queue._queued_seconds["gb-31-20260920-120000-abc"] = 900.0
+        item = platform_item(status="triggered", capacityHeld=True, taskRoot=str(task_root),
+                             addedAt="2026-09-19T23:50:00Z", startedAt="2026-09-20T00:00:00Z",
+                             quota={"state": "claimed", "platformTaskId": "t-31"})
+        queue._items = [item]
+        for _ in range(3):
+            queue._sync_running_locked()
+        self.assertEqual(len(queue._outcomes), 1)
+        record = queue._outcomes[0]
+        self.assertEqual(record["outcome"], "done")
+        self.assertEqual(record["queueSeconds"], 600.0)
+        self.assertEqual(record["initSeconds"], 600.0)
+        self.assertEqual(record["raceSeconds"], 3600.0)
+        self.assertEqual(record["postRaceSeconds"], 1200.0)
+        self.assertEqual(record["containerQueueSeconds"], 900.0)
+        self.assertIn("queue.finished", events)
+        reloaded = build_queue(make_config(self.root))
+        self.assertEqual(len(reloaded._outcomes), 1)
+
+    def test_failed_task_is_recorded_once(self):
+        task_root = self._task("gb-32-20260920-120000-abc", "blocked")
+        queue = build_queue(make_config(self.root))
+        queue.platform = TerminalIdempotencyTests._Platform()
+        item = platform_item(status="triggered", capacityHeld=True, taskRoot=str(task_root),
+                             startedAt=utc_now(), quota={"state": "claimed", "platformTaskId": "t-32"})
+        queue._items = [item]
+        for _ in range(5):
+            queue._sync_running_locked()
+        self.assertEqual([r["outcome"] for r in queue._outcomes], ["failed"])
+
+    def test_throughput_stats_cover_the_window(self):
+        queue = build_queue(make_config(self.root))
+        now = time.time()
+        queue._outcomes = [
+            {"outcome": "done", "finishedAt": iso_from_timestamp(now - 600), "totalSeconds": 3600, "raceSeconds": 1800,
+             "containerQueueSeconds": 100},
+            {"outcome": "done", "finishedAt": iso_from_timestamp(now - 1200), "totalSeconds": 7200, "raceSeconds": 3600,
+             "containerQueueSeconds": 300},
+            {"outcome": "failed", "finishedAt": iso_from_timestamp(now - 1800)},
+            {"outcome": "done", "finishedAt": iso_from_timestamp(now - 90000), "totalSeconds": 1},
+        ]
+        stats = queue.throughput_stats()
+        self.assertEqual(stats["finished"], 2)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["medianTotalSeconds"], 5400.0)
+        self.assertEqual(stats["medianRaceSeconds"], 2700.0)
+        self.assertEqual(stats["avgContainerQueueSeconds"], 200.0)
+        self.assertEqual(stats["maxActiveTasks"], 5)
+        self.assertIn("throughput", queue.fast_snapshot())
+
+
+class ElasticLimitTests(SchedulerTestCase):
+    """With the switch on the limit probes above the floor and backs off on 429."""
+
+    NAME = "gb-41-20260920-120000-abc"
+    RETRY_429 = {"type": "system", "subtype": "api_retry", "attempt": 1, "error_status": 429, "error": "rate_limit"}
+
+    def _queue(self, running, *, enabled=True, **elastic):
+        config = make_config(self.root)
+        config["automation"].update({"maxContainers": 5, "candidatesPerTask": 2,
+                                     "elasticContainers": {"enabled": enabled, **elastic}})
+        docker = fake_docker([
+            {"name": f"sologsb-gb-{90 + index}-20260920-120000-abc-candidate-1-1790000000-a", "state": "running"}
+            for index in range(running)
+        ])
+        root_dir = self.root / "tasks" / self.NAME
+        attempt = root_dir / "monitor" / "runtime" / "candidates" / "candidate-1" / "attempt-01"
+        attempt.mkdir(parents=True, exist_ok=True)
+        (root_dir / "monitor" / "state.json").write_text(json.dumps({
+            "status": "candidates_running", "candidates": {"candidate-1": {"status": "running"}},
+        }), encoding="utf-8")
+        self.stdout = attempt / "stdout.jsonl"
+        self.stdout.write_text('{"type":"system","subtype":"init"}\n', encoding="utf-8")
+        live = platform_item(id="platform-live", status="triggered", capacityHeld=True,
+                             taskRoot=str(root_dir), startedAt=utc_now())
+        queue = build_queue(config, items=[live, platform_item(id="platform-wait", projectCode="gb-2")],
+                            docker=docker)
+        queue._rl_watch_since = 0  # the fixture file counts as new
+        self.events = []
+        queue.log = type("L", (), {"emit": lambda _s, event, **_k: self.events.append(event)})()
+        return queue
+
+    def _step(self, queue):
+        queue._rl_scanned_at = 0
+        with queue._lock:
+            queue._elastic_step_locked()
+
+    def _skill_limit(self, queue):
+        return json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["maxContainers"]
+
+    def test_switch_off_keeps_the_configured_limit(self):
+        queue = self._queue(5, enabled=False)
+        queue._elastic["limit"] = 6
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+
+    def test_full_and_quiet_steps_up_to_the_ceiling_only(self):
+        queue = self._queue(5, ceiling=6)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        self.assertEqual(self._skill_limit(queue), 6)
+        self.assertIn("elastic.up", self.events)
+        queue._elastic["lastChangeAt"] = 0
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        # The form keeps showing the floor, so saving it never raises the floor.
+        snapshot = queue.fast_snapshot()
+        self.assertEqual(snapshot["maxContainers"], 5)
+        self.assertEqual(snapshot["effectiveMaxContainers"], 6)
+
+    def _old_prompt_job(self, queue, cap, *, state="candidates_running"):
+        """A live task whose prompt was rendered with the old fixed cap."""
+        root_dir = self.root / "tasks" / f"old-{cap}-{state}"
+        (root_dir / "monitor").mkdir(parents=True, exist_ok=True)
+        (root_dir / "monitor" / "state.json").write_text(json.dumps({"status": state}), encoding="utf-8")
+        prompt = self.root / f"old-{cap}-{state}.prompt.txt"
+        prompt.write_text(f"- 单 Key 全局硬上限为 {cap} 个候选容器，按“3 个任务”共享名额。\n", encoding="utf-8")
+        job = {"key": f"old-{cap}-{state}", "source": "platform", "status": "running",
+               "platformItemId": f"platform-old-{cap}", "taskRoot": str(root_dir),
+               "triggerPromptPath": str(prompt)}
+        queue.jobs._jobs[job["key"]] = job
+        return job
+
+    def _refresh_pin(self, queue):
+        with queue._lock:
+            queue._refresh_prompt_pin_locked()
+
+    def test_a_cap_written_into_a_live_prompt_holds_the_limit(self):
+        """cy-417 stopped itself when the limit rose past the cap its prompt named."""
+        queue = self._queue(9)
+        self._at(queue, 7)
+        self._old_prompt_job(queue, 6)
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        self.assertEqual(self._skill_limit(queue), 6)
+        self.assertIn("config.limit_pinned_by_prompt", self.events)
+        queue._elastic["lastChangeAt"] = 0
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        self.assertNotIn("elastic.up", self.events)
+        self.assertEqual(queue.elastic_status()["pinnedByPrompt"], 6)
+
+    def test_the_pin_also_holds_a_raised_floor_and_lifts_after_the_race(self):
+        queue = self._queue(9, enabled=False)
+        self._old_prompt_job(queue, 5)
+        self._old_prompt_job(queue, 3, state="candidates_ready")  # past the race: no longer pins
+        queue.config["automation"]["maxContainers"] = 7
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        queue.jobs._jobs.clear()
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 7)
+        self.assertEqual(self._skill_limit(queue), 7)
+        self.assertIn("config.limit_pin_released", self.events)
+
+    def test_no_step_up_with_free_slots(self):
+        queue = self._queue(3)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+
+    def test_default_ceiling_is_the_skill_hard_cap(self):
+        queue = self._queue(9)
+        for _ in range(5):
+            queue._elastic["lastChangeAt"] = 0
+            self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 8)
+
+    def _write_429(self, *, attempt=1, delay_ms=500.0, times=1):
+        with self.stdout.open("a", encoding="utf-8") as handle:
+            for _ in range(times):
+                handle.write(json.dumps({**self.RETRY_429, "attempt": attempt, "retry_delay_ms": delay_ms}) + "\n")
+
+    def _at(self, queue, limit):
+        queue._elastic.update({"limit": limit, "lastChangeAt": time.time(), "hour": time.localtime().tm_hour})
+        queue.sync_skill_limits()
+
+    def test_a_quick_429_retry_does_not_cost_a_container(self):
+        queue = self._queue(9)
+        self._at(queue, 6)
+        queue._elastic["lastChangeAt"] = 0
+        self._write_429(delay_ms=600)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 7)
+        self.assertNotIn("elastic.down", self.events)
+
+    def test_costly_retries_step_down_but_never_below_the_floor(self):
+        queue = self._queue(6)
+        self._at(queue, 6)
+        # 60 s of retry waits = 3.3% of 6 containers x 5 minutes.
+        self._write_429(delay_ms=10000, times=6)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        self.assertEqual(self._skill_limit(queue), 5)
+        self.assertIn("elastic.down", self.events)
+        self.assertEqual(queue._learned_limit(time.time()), 5)
+        self._write_429(delay_ms=10000, times=6)
+        queue._elastic["lastDownAt"] = 0
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        self.assertIn("elastic.rate_limited_at_floor", self.events)
+
+    def test_a_request_retried_many_times_steps_down(self):
+        queue = self._queue(6)
+        self._at(queue, 6)
+        self._write_429(attempt=6, delay_ms=1000)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+
+    def test_old_lines_are_not_counted_twice(self):
+        queue = self._queue(6)
+        self._at(queue, 6)
+        self._write_429(delay_ms=700)
+        with queue._lock:
+            queue._rl_scanned_at = 0
+            self.assertEqual(queue._scan_rate_limits_locked(), [(1, 0.7)])
+            queue._rl_scanned_at = 0
+            self.assertEqual(queue._scan_rate_limits_locked(), [])
+
+    def test_no_step_up_during_the_cooldown_after_a_step_down(self):
+        queue = self._queue(5)
+        queue._elastic["lastPressureAt"] = time.time() - 60
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+
+    def test_stable_limit_is_learned_and_resumed(self):
+        queue = self._queue(9, stableSeconds=600)
+        self._at(queue, 7)
+        queue._elastic["lastChangeAt"] = time.time() - 700
+        self._step(queue)
+        self.assertEqual(queue._learned_limit(time.time()), 7)
+        # Toggling the switch starts from the learned limit, not the floor.
+        queue.reset_elastic()
+        self.assertEqual(queue._max_containers_limit(), 7)
+        # Entering the hour again jumps straight to it.
+        queue._elastic.update({"limit": 5, "hour": (time.localtime().tm_hour + 1) % 24})
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 7)
+        self.assertIn("elastic.resume", self.events)
+
+
 class SingleLimitTests(SchedulerTestCase):
     """``maxContainers`` is the one limit, shared with the skill's limiter."""
 
@@ -1180,7 +1638,7 @@ class SingleLimitTests(SchedulerTestCase):
         return build_queue(config)
 
     def test_limit_is_clamped_to_the_skill_hard_cap(self):
-        self.assertEqual(self._queue(maxContainers=12)._max_containers_limit(), 6)
+        self.assertEqual(self._queue(maxContainers=12)._max_containers_limit(), 8)
         self.assertEqual(self._queue(maxContainers=5)._max_containers_limit(), 5)
 
     def test_limit_is_published_for_the_skill(self):
@@ -1425,6 +1883,49 @@ class NoticeHygieneTests(SchedulerTestCase):
         queue._sync_running_locked()
         self.assertNotIn("stalledSince", item)
         self.assertNotIn("notice", item)
+
+
+class DeadWorkerReapTests(SchedulerTestCase):
+    """A worker recovered at startup has no _wait thread; its death must still free the slot."""
+
+    def test_recovered_job_is_finalized_once_its_worker_exits(self):
+        jobs_dir = state_dir_of(self.config) / "jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        result_file = jobs_dir / "result.json"
+        result_file.write_text(json.dumps({"status": "failed", "error": "blocked"}), encoding="utf-8")
+        job = {"key": "platform:platform-1", "source": "platform", "platformItemId": "platform-1",
+               "status": "running", "pid": 999999, "startedAt": utc_now(), "resultFile": str(result_file),
+               "logPath": str(jobs_dir / "20260926-100000-platform-platform-1.log")}
+        (jobs_dir / "20260926-100000-platform-platform-1.json").write_text(json.dumps(job), encoding="utf-8")
+        with mock.patch("api.scheduler.persisted_job_process_alive", return_value=True), \
+                mock.patch.object(JobManager, "reap_orphan_workers", return_value=[]):
+            manager = JobManager(self.config, state_dir=jobs_dir)
+        self.assertEqual(len(manager.running()), 1)
+        with mock.patch("api.scheduler.persisted_job_process_alive", return_value=True):
+            self.assertEqual(manager.reap_dead_jobs(), [])
+        with mock.patch("api.scheduler.persisted_job_process_alive", return_value=False):
+            reaped = manager.reap_dead_jobs()
+        self.assertEqual([item["status"] for item in reaped], ["failed"])
+        self.assertEqual(manager.running(), [])
+        persisted = json.loads((jobs_dir / "20260926-100000-platform-platform-1.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["error"], "blocked")
+
+
+    def test_task_waiting_for_qc_does_not_hold_an_active_slot(self):
+        task_root = self.root / "tasks" / "gb-1-20260926-100000-qcqc"
+        (task_root / "monitor" / "submission").mkdir(parents=True, exist_ok=True)
+        (task_root / "monitor" / "state.json").write_text(json.dumps({"status": "recorded"}), encoding="utf-8")
+        queue = build_queue(self.config)
+        job = {"key": "platform:platform-1", "source": "platform", "platformItemId": "platform-1",
+               "status": "running", "pid": os.getpid(), "startedAt": utc_now(), "resultFile": "",
+               "taskRoot": str(task_root)}
+        with mock.patch("api.scheduler.persisted_job_process_alive", return_value=True):
+            self.assertFalse(queue._job_task_terminal(job))
+            (task_root / "monitor" / "submission" / "api-result.json").write_text(
+                json.dumps({"status": "submitted_polling", "submissionId": "s1"}), encoding="utf-8")
+            self.assertTrue(queue._job_task_terminal(job))
+
 
 if __name__ == "__main__":
     unittest.main()

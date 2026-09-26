@@ -184,6 +184,20 @@
   }
 
   /* ------------------------------------------------------------ metric band */
+  // Completed tasks over the last 24 h and their median wall-clock time: the
+  // number that says whether starting more tasks actually made things faster.
+  function throughputLine(stats) {
+    if (!stats || !(stats.finished || stats.failed)) return "";
+    const median = stats.medianTotalSeconds ? ` · 中位 ${Math.round(stats.medianTotalSeconds / 60)} 分钟` : "";
+    return `24h 完成 ${stats.finished}${stats.failed ? ` / 失败 ${stats.failed}` : ""}${median}`;
+  }
+
+  // ``docker ps`` timed out: the count is the last good listing, not zero.
+  function staleLine(containers) {
+    const age = Number(containers.staleSeconds);
+    return `Docker 响应慢，显示${Number.isFinite(age) && age > 0 ? ` ${Math.round(age)} 秒前的` : "上次"}快照`;
+  }
+
   function renderMetrics(state) {
     const band = $("#band");
     if (!band) return;
@@ -211,7 +225,7 @@
     const cells = [
       {
         k: "运行中任务", v: summary.active || 0, tone: "run",
-        s: `并发上限 ${queue.maxTasks || queue.capacity || 0} · 队列占用 ${counts.running || 0}`,
+        s: `并发上限 ${(queue.scheduleMode === "containers" ? queue.maxActiveTasks : queue.maxTasks) || queue.capacity || 0} · 队列占用 ${counts.running || 0}`,
       },
       {
         k: "运行容器", v: running, unit: limit ? `/ ${limit}` : "", tone: "run",
@@ -221,6 +235,7 @@
           Number(containers.foreign || 0) ? `外部 ${Number(containers.foreign)}` : "",
           Number(containers.others || 0) ? `验证等 ${Number(containers.others)} 不计` : "",
           phantom ? `忽略失联 ${phantom}` : "",
+          containers.stale ? staleLine(containers) : "",
         ].filter(Boolean).join(" · "),
         meter: limit ? Math.min(100, Math.round((running / limit) * 100)) : null,
       },
@@ -235,7 +250,10 @@
       },
       {
         k: "已完成", v: summary.finished || 0, tone: "ok",
-        s: `共 ${summary.tasks || 0} 个任务 · 队列完成 ${counts.done || 0}`,
+        s: [
+          `共 ${summary.tasks || 0} 个任务 · 队列完成 ${counts.done || 0}`,
+          throughputLine(queue.throughput),
+        ].filter(Boolean).join(" · "),
       },
     ];
     setHtml(band, cells.map((cell) => `

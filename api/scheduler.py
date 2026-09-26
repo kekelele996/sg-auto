@@ -23,6 +23,7 @@ import os
 import random
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -104,9 +105,45 @@ CONTAINER_SLOT_ROOT = Path(
 )
 ATTEMPTS_ALERT_THRESHOLD = 500
 # side_runner.ABSOLUTE_MAX_CONTAINERS; the skill clamps anything above it.
-SKILL_ABSOLUTE_MAX_CONTAINERS = 6
+SKILL_ABSOLUTE_MAX_CONTAINERS = 8
 SKILL_LIMIT_MANAGED_BY = "sologsb-monitor"
 MIN_LAUNCH_SPACING_SECONDS = 20
+# side_runner.CONTAINER_SETTINGS_REFRESH_SECONDS: how long a running executor
+# may keep enforcing an old limit after container-limit.json is rewritten.
+SKILL_SETTINGS_REFRESH_SECONDS = 180
+MAX_ACTIVE_TASKS_CEILING = 50
+DEFAULT_MAX_POST_CANDIDATE_TASKS = 8
+# The fixed cap older prompt templates rendered into each task.
+PROMPT_HARD_CAP_RE = re.compile(r"单 Key 全局硬上限为 (\d+)")
+# Elastic container limit: probe one container above the floor at a time and
+# back off when 429s (the key's max_parallel_requests) actually cost time.
+# Most 429s are absorbed by the first retry within a second (0925/0926: 105 of
+# 153, 6 minutes of waiting in two days), so the signal is the retry wait per
+# container, not the number of 429 lines.
+RATE_LIMIT_SCAN_SECONDS = 15
+RATE_LIMIT_WINDOW_SECONDS = 300
+RATE_LIMIT_READ_CAP = 4 * 1024 * 1024
+# A limit learned for an hour of the day is trusted for a week.
+ELASTIC_LEARNED_TTL_SECONDS = 7 * 86400
+ELASTIC_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "ceiling": SKILL_ABSOLUTE_MAX_CONTAINERS,
+    # At least the skill's settings refresh, so a raised limit has been
+    # applied (and had a chance to draw a 429) before the next step.
+    "stepUpSeconds": 300,
+    # No step up this long after the last step down for rate limiting.
+    "cooldownSeconds": 600,
+    # Step down when 429 retry waits exceed this share of container time in
+    # the window, or one request needed ``severeAttempt`` retries.
+    "stallPercent": 3,
+    "severeAttempt": 6,
+    # A limit held this long, full and without pressure, is remembered for the
+    # hour of day and resumed from later.
+    "stableSeconds": 1800,
+}
+# Finished/failed task records kept for the throughput view.
+OUTCOME_HISTORY_LIMIT = 1000
+THROUGHPUT_WINDOW_HOURS = 24
 # A task dir the skill still counts as "active" (project_claims._task_is_active)
 # is only closed by the monitor once its state file has been quiet this long,
 # so an executor mid-write is never raced.
@@ -139,6 +176,32 @@ def prune_legacy_automation(automation: dict[str, Any]) -> list[str]:
     return removed
 
 
+def _rate_limit_retries(chunk: bytes) -> list[tuple[int, float]]:
+    """429 retries in a slice of a candidate's stream-json output.
+
+    Returns ``(attempt, retry wait in seconds)`` per retry.
+    """
+    retries: list[tuple[int, float]] = []
+    for line in chunk.split(b"\n"):
+        if b"api_retry" not in line or b"429" not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("subtype") == "api_retry" and str(event.get("error_status")) == "429":
+            try:
+                attempt = int(event.get("attempt") or 1)
+            except (TypeError, ValueError):
+                attempt = 1
+            try:
+                wait = max(0.0, float(event.get("retry_delay_ms") or 0) / 1000)
+            except (TypeError, ValueError):
+                wait = 0.0
+            retries.append((attempt, wait))
+    return retries
+
+
 def _remove_empty_task_root(raw: Any) -> bool:
     """Drop a task directory the desktop session never used.
 
@@ -161,6 +224,10 @@ def _write_json(path: Path, value: Any) -> None:
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temp, path)
 
+
+# submit_api.py result statuses once the submission exists: the worker only
+# polls (or reports) the QC verdict from here on.
+QC_WAITING_SUBMISSION_STATUSES = frozenset({"submitted_polling", "submitted", "submitted_not_passed"})
 
 class JobManager:
     """Owns the subprocesses that run the skill CLI and the queue worker."""
@@ -384,6 +451,41 @@ class JobManager:
                 reaped.append(copy.deepcopy(job))
         return reaped
 
+    @staticmethod
+    def _finalize_dead_job(job: dict[str, Any]) -> dict[str, Any]:
+        result_file = Path(str(job.get("resultFile") or ""))
+        result = read_json(result_file, {}) if result_file else {}
+        if isinstance(result, dict) and result.get("status") == "finished":
+            job["status"] = "finished"
+            job["exitCode"] = int(result.get("exitCode") or 0)
+        else:
+            job["status"] = "failed"
+            job["exitCode"] = int((result or {}).get("exitCode") or -1)
+        job["finishedAt"] = utc_now()
+        if job["status"] == "failed":
+            job["error"] = str((result or {}).get("error") or "监控重启后发现执行器进程已退出")
+        return job
+
+    def reap_dead_jobs(self) -> list[dict[str, Any]]:
+        """Finalize running jobs whose worker process has exited.
+
+        Jobs recovered at startup have no ``_wait`` thread, so without this they
+        stay ``running`` after the worker dies and keep holding an active slot.
+        """
+        reaped: list[dict[str, Any]] = []
+        with self._lock:
+            for job in self._jobs.values():
+                if job.get("status") != "running" or not job.get("pid"):
+                    continue
+                if persisted_job_process_alive(job):
+                    continue
+                self._finalize_dead_job(job)
+                started = parse_time(job.get("startedAt"))
+                job["durationSeconds"] = max(0.0, time.time() - (started.timestamp() if started else time.time()))
+                self._persist(job)
+                reaped.append(copy.deepcopy(job))
+        return reaped
+
     # -- starting --------------------------------------------------------- #
     def start(
         self,
@@ -465,19 +567,7 @@ class JobManager:
         with self._lock:
             key = f"platform:{item_id}"
 
-            def finalize_dead_job(job: dict[str, Any]) -> dict[str, Any]:
-                result_file = Path(str(job.get("resultFile") or ""))
-                result = read_json(result_file, {}) if result_file else {}
-                if isinstance(result, dict) and result.get("status") == "finished":
-                    job["status"] = "finished"
-                    job["exitCode"] = int(result.get("exitCode") or 0)
-                else:
-                    job["status"] = "failed"
-                    job["exitCode"] = int((result or {}).get("exitCode") or -1)
-                job["finishedAt"] = utc_now()
-                if job["status"] == "failed":
-                    job["error"] = str((result or {}).get("error") or "监控重启后发现执行器进程已退出")
-                return job
+            finalize_dead_job = self._finalize_dead_job
 
             item = self._jobs.get(key)
             if item is not None and run_key and str(item.get("runKey") or "") != str(run_key):
@@ -1001,6 +1091,26 @@ class QueueManager:
         # limit has room: first-seen time per task, and which ones were logged.
         self._starved_since: dict[str, float] = {}
         self._phantom_logged: set[str] = set()
+        # Starved demand whose executor is still alive: warned about once.
+        self._starved_logged: set[str] = set()
+        # Seconds each task has had candidates waiting for a container, and
+        # when that was last measured (in memory only; restarts reset it).
+        self._queued_seconds: dict[str, float] = {}
+        self._queued_last: dict[str, float] = {}
+        self._skill_limit_resynced_at = 0.0
+        self._oversubscribed = False
+        self.outcomes_path = self.state_path.parent / "outcomes.json"
+        self.elastic_path = self.state_path.parent / "elastic.json"
+        loaded_elastic = read_json(self.elastic_path, {})
+        self._prompt_pin: dict[str, Any] = {}
+        self._elastic: dict[str, Any] = loaded_elastic if isinstance(loaded_elastic, dict) else {}
+        self._rl_offsets: dict[str, int] = {}
+        # (seen at, attempt, retry wait seconds) per 429 in the window.
+        self._rl_hits: list[tuple[float, int, float]] = []
+        self._rl_scanned_at = 0.0
+        self._rl_watch_since = time.time()
+        self._rl_floor_logged_at = 0.0
+        self._outcomes = self._load_outcomes()
         self._items = self._load()
         self._recover_triggered()
         self.sync_skill_limits()
@@ -1015,6 +1125,108 @@ class QueueManager:
         if not isinstance(items, list):
             return []
         return [item for item in items if isinstance(item, dict)]
+
+    def _load_outcomes(self) -> list[dict[str, Any]]:
+        raw = read_json(self.outcomes_path, {})
+        records = raw.get("records") if isinstance(raw, dict) else []
+        return [r for r in records if isinstance(r, dict)][-OUTCOME_HISTORY_LIMIT:] if isinstance(records, list) else []
+
+    def _record_outcome(self, item: dict[str, Any], outcome: str) -> None:
+        """Keep one record per finished task: where its wall-clock time went.
+
+        Done items leave the queue, so without this nothing tells how long a
+        task took or whether starting more tasks made the machine faster.
+        """
+        task_root = Path(str(item.get("taskRoot") or "")) if item.get("taskRoot") else None
+        state = read_json(task_root / "monitor" / "state.json", {}) if task_root else {}
+        if not isinstance(state, dict):
+            state = {}
+        finished_at = str(item.get("finishedAt") or utc_now())
+
+        def span(start: Any, end: Any) -> float | None:
+            a, b = parse_time(start), parse_time(end)
+            if a is None or b is None:
+                return None
+            return round(max(0.0, b.timestamp() - a.timestamp()), 1)
+
+        race_end = state.get("candidateRaceFinishedAt")
+        post_end = state.get("gsbExportedAt") or state.get("publishedAt") or finished_at
+        task_name = str(state.get("taskName") or (task_root.name if task_root else ""))
+        container_queue = self._queued_seconds.pop(task_name, None)
+        self._queued_last.pop(task_name, None)
+        record = {
+            "id": str(item.get("id") or ""),
+            "projectCode": str(item.get("projectCode") or ""),
+            "taskType": str(item.get("taskType") or ""),
+            "taskName": task_name,
+            "outcome": outcome,
+            "error": str(item.get("error") or "") if outcome == "failed" else "",
+            "addedAt": str(item.get("addedAt") or ""),
+            "startedAt": str(item.get("startedAt") or ""),
+            "finishedAt": finished_at,
+            "totalSeconds": span(item.get("startedAt"), finished_at),
+            "queueSeconds": span(item.get("addedAt"), item.get("startedAt")),
+            "initSeconds": span(state.get("createdAt"), state.get("candidateRaceStartedAt")),
+            "raceSeconds": span(state.get("candidateRaceStartedAt"), race_end),
+            "postRaceSeconds": span(race_end, post_end) if race_end else None,
+            "containerQueueSeconds": round(container_queue, 1) if container_queue is not None else None,
+        }
+        self._outcomes = (self._outcomes + [record])[-OUTCOME_HISTORY_LIMIT:]
+        try:
+            atomic_write_json(self.outcomes_path, {"records": self._outcomes, "updatedAt": utc_now()})
+        except OSError:
+            pass
+
+        def minutes(value: float | None) -> str:
+            return "-" if value is None else f"{value / 60:.0f}m"
+
+        self._emit(
+            "info" if outcome == "done" else "warning",
+            "queue.finished" if outcome == "done" else "queue.failed",
+            taskId=record["id"],
+            projectCode=record["projectCode"],
+            detail=(
+                f"总耗时 {minutes(record['totalSeconds'])}（初始化 {minutes(record['initSeconds'])}，"
+                f"候选 {minutes(record['raceSeconds'])}，其中等容器 {minutes(record['containerQueueSeconds'])}，"
+                f"收尾 {minutes(record['postRaceSeconds'])}）"
+            ),
+        )
+
+    def throughput_stats(self, window_hours: int = THROUGHPUT_WINDOW_HOURS) -> dict[str, Any]:
+        """Completed-task throughput and median phase times over a window."""
+        cutoff = time.time() - window_hours * 3600
+        with self._lock:
+            records = list(self._outcomes)
+            active = sum(1 for item in self._items if item.get("status") in QUEUE_ACTIVE_STATUSES)
+            max_active = self._max_active_tasks()
+        recent = []
+        for record in records:
+            finished = parse_time(record.get("finishedAt"))
+            if finished is not None and finished.timestamp() >= cutoff:
+                recent.append(record)
+        done = [r for r in recent if r.get("outcome") == "done"]
+
+        def median(key: str) -> float | None:
+            values = [float(r[key]) for r in done if isinstance(r.get(key), (int, float))]
+            return round(statistics.median(values), 1) if values else None
+
+        def mean(key: str) -> float | None:
+            values = [float(r[key]) for r in done if isinstance(r.get(key), (int, float))]
+            return round(statistics.fmean(values), 1) if values else None
+
+        return {
+            "windowHours": window_hours,
+            "finished": len(done),
+            "failed": len(recent) - len(done),
+            "perHour": round(len(done) / window_hours, 2),
+            "medianTotalSeconds": median("totalSeconds"),
+            "medianInitSeconds": median("initSeconds"),
+            "medianRaceSeconds": median("raceSeconds"),
+            "medianPostRaceSeconds": median("postRaceSeconds"),
+            "avgContainerQueueSeconds": mean("containerQueueSeconds"),
+            "activeTasks": active,
+            "maxActiveTasks": max_active,
+        }
 
     def _save(self) -> None:
         atomic_write_json(
@@ -1111,14 +1323,324 @@ class QueueManager:
         value = str(self._automation_cfg().get("scheduleMode") or SCHEDULE_MODE_CONTAINERS).strip().lower()
         return value if value in SCHEDULE_MODES else SCHEDULE_MODE_CONTAINERS
 
-    def _max_containers_limit(self) -> int:
-        """The single container limit, shared with the skill's limiter."""
+    def _base_containers_limit(self) -> int:
+        """The configured ``maxContainers``; the floor of the elastic limit."""
         return clamp_int(
             self._automation_cfg().get("maxContainers"),
             1,
             SKILL_ABSOLUTE_MAX_CONTAINERS,
             DEFAULT_MAX_CANDIDATE_CONTAINERS,
         )
+
+    def _elastic_cfg(self) -> dict[str, Any]:
+        raw = self._automation_cfg().get("elasticContainers")
+        raw = raw if isinstance(raw, dict) else {}
+        base = self._base_containers_limit()
+        return {
+            "enabled": bool(raw.get("enabled", ELASTIC_DEFAULTS["enabled"])),
+            "ceiling": clamp_int(raw.get("ceiling"), base, SKILL_ABSOLUTE_MAX_CONTAINERS, ELASTIC_DEFAULTS["ceiling"]),
+            "stepUpSeconds": clamp_int(raw.get("stepUpSeconds"), SKILL_SETTINGS_REFRESH_SECONDS, 86400,
+                                       ELASTIC_DEFAULTS["stepUpSeconds"]),
+            "cooldownSeconds": clamp_int(raw.get("cooldownSeconds"), SKILL_SETTINGS_REFRESH_SECONDS, 86400,
+                                         ELASTIC_DEFAULTS["cooldownSeconds"]),
+            "stallPercent": clamp_int(raw.get("stallPercent"), 1, 50, ELASTIC_DEFAULTS["stallPercent"]),
+            "severeAttempt": clamp_int(raw.get("severeAttempt"), 2, 10, ELASTIC_DEFAULTS["severeAttempt"]),
+            "stableSeconds": clamp_int(raw.get("stableSeconds"), 600, 86400, ELASTIC_DEFAULTS["stableSeconds"]),
+        }
+
+    def _max_containers_limit(self) -> int:
+        """The single container limit in force, shared with the skill's limiter.
+
+        With the elastic switch on it moves between the configured floor and
+        the ceiling; otherwise it is the configured value.
+        """
+        base = self._base_containers_limit()
+        cfg = self._elastic_cfg()
+        limit = clamp_int(self._elastic.get("limit"), base, cfg["ceiling"], base) if cfg["enabled"] else base
+        pinned = self._prompt_pin.get("limit") or 0
+        return min(limit, pinned) if pinned else limit
+
+    def _refresh_prompt_pin_locked(self) -> None:
+        """Hold the limit at the lowest cap written into a live task's prompt.
+
+        Prompts rendered before 2026-09-26 carry 「单 Key 全局硬上限为 N」.  An
+        agent that later reads a higher limit in container-limit.json decides
+        it broke the user's cap and stops (cy-417 at 7 → 8).  Until every such
+        task is past its candidate race, the limit — elastic or configured —
+        stays at or below the lowest N.
+        """
+        pins: list[tuple[int, str]] = []
+        for job in self.jobs.running():
+            if job.get("source") != "platform" or self._job_candidate_phase_finished(job):
+                continue
+            prompt_path = Path(str(job.get("triggerPromptPath") or ""))
+            prompt = self.file_cache.text(prompt_path) if prompt_path.is_file() else ""
+            match = PROMPT_HARD_CAP_RE.search(prompt)
+            if match:
+                pins.append((int(match.group(1)), str(job.get("platformItemId") or "")))
+        limit = min((value for value, _ in pins), default=0)
+        previous = self._prompt_pin.get("limit") or 0
+        self._prompt_pin = {"limit": limit, "tasks": len(pins),
+                            "items": [item for value, item in pins if value == limit]}
+        if limit != previous:
+            if limit:
+                self._emit("warning", "config.limit_pinned_by_prompt",
+                           detail=f"{len(pins)} 个运行中任务的提示词写死了容器上限，最低 {limit}："
+                                  f"容器上限暂不超过 {limit}，这些任务跑完候选赛后自动解除")
+            else:
+                self._emit("info", "config.limit_pin_released",
+                           detail=f"写死容器上限的任务都已跑完候选赛，恢复按配置 / 弹性上限（此前暂按 {previous}）")
+            self.sync_skill_limits()
+
+    def _rate_limit_pressure(self, now: float, limit: int) -> tuple[float, int, int]:
+        """(share of container time spent in 429 retry waits, worst attempt, 429 count) in the window."""
+        recent = [hit for hit in self._rl_hits if now - hit[0] < RATE_LIMIT_WINDOW_SECONDS]
+        wait = sum(hit[2] for hit in recent)
+        worst = max((hit[1] for hit in recent), default=0)
+        return wait / (max(1, limit) * RATE_LIMIT_WINDOW_SECONDS), worst, len(recent)
+
+    def _learned_limit(self, now: float) -> int:
+        """The limit that held last week at this hour of day, 0 if none."""
+        learned = self._elastic.get("learned")
+        entry = learned.get(str(time.localtime(now).tm_hour)) if isinstance(learned, dict) else None
+        if not isinstance(entry, dict) or now - float(entry.get("at") or 0) > ELASTIC_LEARNED_TTL_SECONDS:
+            return 0
+        try:
+            return int(entry.get("limit") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _learn_limit(self, now: float, limit: int, *, lower: bool = False) -> None:
+        """Remember ``limit`` for this hour of day.
+
+        A step down for rate limiting always overwrites; a stable limit only
+        raises the entry (and refreshes it at most hourly).
+        """
+        learned = self._elastic.get("learned")
+        learned = learned if isinstance(learned, dict) else {}
+        key = str(time.localtime(now).tm_hour)
+        if not lower:
+            previous = self._learned_limit(now)
+            if limit < previous:
+                return
+            entry = learned.get(key) if isinstance(learned.get(key), dict) else {}
+            if limit == previous and now - float(entry.get("at") or 0) < 3600:
+                return
+        learned[key] = {"limit": limit, "at": now}
+        self._elastic["learned"] = learned
+        self._save_elastic()
+
+    def elastic_status(self) -> dict[str, Any]:
+        cfg = self._elastic_cfg()
+        now = time.time()
+        current = self._max_containers_limit()
+        stall, worst, count = self._rate_limit_pressure(now, current)
+        return {
+            **cfg,
+            "floor": self._base_containers_limit(),
+            "current": current,
+            "recentRateLimits": count,
+            "stallPercentNow": round(stall * 100, 1),
+            "worstAttempt": worst,
+            "learnedForHour": self._learned_limit(now),
+            "last429At": iso_from_timestamp(self._elastic["last429At"]) if self._elastic.get("last429At") else "",
+            "lastPressureAt": iso_from_timestamp(self._elastic["lastPressureAt"]) if self._elastic.get("lastPressureAt") else "",
+            "lastChangeAt": iso_from_timestamp(self._elastic["lastChangeAt"]) if self._elastic.get("lastChangeAt") else "",
+            "lastReason": str(self._elastic.get("lastReason") or ""),
+            "pinnedByPrompt": int(self._prompt_pin.get("limit") or 0),
+            "pinnedTasks": int(self._prompt_pin.get("tasks") or 0),
+        }
+
+    def reset_elastic(self) -> None:
+        """Start again (switch toggled or floor changed) from what this hour learned, else the floor."""
+        with self._lock:
+            now = time.time()
+            keep = ("last429At", "lastPressureAt", "learned")
+            self._elastic = {k: v for k, v in self._elastic.items() if k in keep}
+            learned = self._learned_limit(now)
+            if learned:
+                self._elastic.update({"limit": learned, "hour": time.localtime(now).tm_hour,
+                                      "lastReason": f"从本时段学到的 {learned} 个容器开始"})
+            self._rl_hits = []
+            self._save_elastic()
+
+    def _save_elastic(self) -> None:
+        try:
+            atomic_write_json(self.elastic_path, {**self._elastic, "updatedAt": utc_now()})
+        except OSError:
+            pass
+
+    def _scan_rate_limits_locked(self) -> list[tuple[int, float]]:
+        """Count 429 retries written by live candidates since the last scan.
+
+        Claude Code logs every rejected request as a ``system/api_retry``
+        event with ``error_status: 429`` in the candidate's ``stdout.jsonl``.
+        Only bytes appended since the previous scan are read; files that
+        existed before the monitor started are read from their current end.
+        """
+        now = time.time()
+        if now - self._rl_scanned_at < RATE_LIMIT_SCAN_SECONDS:
+            return []
+        self._rl_scanned_at = now
+        found: list[tuple[int, float]] = []
+        seen: set[str] = set()
+        for item in self._items:
+            if item.get("status") not in QUEUE_ACTIVE_STATUSES or not item.get("taskRoot"):
+                continue
+            runtime = Path(str(item["taskRoot"])) / "monitor" / "runtime" / "candidates"
+            for path in runtime.glob("*/attempt-*/stdout.jsonl"):
+                key = str(path)
+                seen.add(key)
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                offset = self._rl_offsets.get(key)
+                if offset is None:
+                    born = getattr(st, "st_birthtime", st.st_ctime)
+                    offset = 0 if born >= self._rl_watch_since else st.st_size
+                if st.st_size < offset:
+                    offset = 0
+                if st.st_size > offset:
+                    start = max(offset, st.st_size - RATE_LIMIT_READ_CAP)
+                    try:
+                        with path.open("rb") as handle:
+                            handle.seek(start)
+                            chunk = handle.read(st.st_size - start)
+                    except OSError:
+                        continue
+                    end = chunk.rfind(b"\n")
+                    if end >= 0:
+                        found.extend(_rate_limit_retries(chunk[:end + 1]))
+                        offset = start + end + 1
+                self._rl_offsets[key] = offset
+        for key in list(self._rl_offsets):
+            if key not in seen:
+                self._rl_offsets.pop(key, None)
+        return found
+
+    def _elastic_demand_locked(self, limit: int, *, need_waiting: bool = True) -> bool:
+        """Raising the limit only helps when it is full and work is waiting."""
+        with self._lock:
+            _tasks, detail = self._capacity_usage_locked(self._startup_timeout())
+        used = int(detail.get("nonTestContainerCount") or 0) + int(detail.get("grantedSlots") or 0)
+        if used < limit:
+            return False
+        if not need_waiting or int(detail.get("queuedCandidates") or 0) > 0:
+            return True
+        paused = bool(self._automation_cfg().get("paused", True))
+        return not paused and any(
+            item.get("status") == "pending" and item.get("source") == "platform" for item in self._items
+        )
+
+    def _elastic_step_locked(self) -> None:
+        """Move the elastic limit: down when 429 waits cost time, up when full and quiet.
+
+        Isolated 429s absorbed by a sub-second retry are tolerated: giving up
+        a container for them costs far more than the wait.
+        """
+        cfg = self._elastic_cfg()
+        if not cfg["enabled"] or self._schedule_mode() != SCHEDULE_MODE_CONTAINERS:
+            return
+        now = time.time()
+        retries = self._scan_rate_limits_locked()
+        if retries:
+            self._rl_hits.extend((now, attempt, wait) for attempt, wait in retries)
+            self._elastic["last429At"] = now
+            self._save_elastic()
+        self._rl_hits = [hit for hit in self._rl_hits if now - hit[0] < RATE_LIMIT_WINDOW_SECONDS]
+        base = self._base_containers_limit()
+        current = self._max_containers_limit()
+        stall, worst, count = self._rate_limit_pressure(now, current)
+        stall_limit = cfg["stallPercent"] / 100
+
+        def move(to: int, event: str, reason: str) -> None:
+            self._elastic.update({"limit": to, "lastChangeAt": now, "lastReason": reason})
+            if to < current:
+                self._elastic["lastDownAt"] = now
+            self._save_elastic()
+            self.sync_skill_limits()
+            self._emit("warning" if to < current else "info", event, detail=reason)
+
+        if stall >= stall_limit or worst >= cfg["severeAttempt"]:
+            cause = (f"近 5 分钟 {count} 次 429，重试等待占容器时间 {stall * 100:.1f}%"
+                     + (f"，单次请求重试到第 {worst} 次" if worst >= cfg["severeAttempt"] else ""))
+            # One step per skill refresh: a lower limit needs up to 180 s to
+            # reach every executor, and one burst's retries span several scans.
+            if now - float(self._elastic.get("lastDownAt") or 0) < SKILL_SETTINGS_REFRESH_SECONDS:
+                return
+            self._elastic["lastPressureAt"] = now
+            if current > base:
+                self._rl_hits = []
+                self._learn_limit(now, current - 1, lower=True)
+                move(current - 1, "elastic.down", f"{cause}，容器上限 {current} → {current - 1}（保底 {base}）")
+            elif now - self._rl_floor_logged_at >= cfg["cooldownSeconds"]:
+                self._rl_floor_logged_at = now
+                self._save_elastic()
+                self._emit("warning", "elastic.rate_limited_at_floor",
+                           detail=f"{cause}，已在保底 {base} 个容器，保底值可能偏高")
+            return
+
+        last_pressure = float(self._elastic.get("lastPressureAt") or 0)
+        full = self._elastic_demand_locked(current, need_waiting=False)
+        # Held long enough, full and quiet: remember it for this hour.
+        if full and now - max(float(self._elastic.get("lastChangeAt") or 0), last_pressure) >= cfg["stableSeconds"]:
+            self._learn_limit(now, current)
+
+        # A live task's prompt caps the limit: going past it would stop that task.
+        pinned = self._prompt_pin.get("limit") or 0
+        ceiling = min(cfg["ceiling"], pinned) if pinned else cfg["ceiling"]
+
+        # New hour: go straight to what held at this hour before.
+        hour = time.localtime(now).tm_hour
+        if self._elastic.get("hour") != hour:
+            self._elastic["hour"] = hour
+            self._save_elastic()
+            learned = min(self._learned_limit(now), ceiling)
+            if learned > current and now - last_pressure >= cfg["cooldownSeconds"]:
+                move(learned, "elastic.resume", f"本时段之前稳定在 {learned} 个容器，容器上限 {current} → {learned}")
+                return
+
+        if current >= ceiling:
+            return
+        # Retries still noticeable (over half the step-down line): hold.
+        if stall >= stall_limit / 2:
+            return
+        if now - last_pressure < cfg["cooldownSeconds"]:
+            return
+        if now - float(self._elastic.get("lastChangeAt") or 0) < cfg["stepUpSeconds"]:
+            return
+        if self._elastic_demand_locked(current):
+            quiet = f"近 5 分钟 429 重试等待 {stall * 100:.1f}%" if count else "近 5 分钟无 429"
+            move(current + 1, "elastic.up",
+                 f"容器已满且有任务在等，{quiet}，容器上限 {current} → {current + 1}（上限 {cfg['ceiling']}）")
+
+    def _max_active_tasks(self) -> int:
+        """Cap on tasks not yet past the candidate race, in container mode.
+
+        Container demand alone never stopped launches: 5 containers ended up
+        shared by 19 tasks.  Tasks past the race have their own cap
+        (``_max_post_candidate_tasks``); counting them here left containers
+        empty while 6 of 8 live tasks were only reviewing and recording.
+
+        It is a safety net, not what keeps containers full: a task holds its
+        containers only during the race, and tasks still initialising reserve
+        a batch without using it yet.  Launches are already paced by the
+        free-slot and queued-candidate gates.
+        """
+        batch = max(1, self._candidates_per_task())
+        derived = 2 * -(-self._max_containers_limit() // batch) + 1
+        return clamp_int(self._automation_cfg().get("maxActiveTasks"), 1, MAX_ACTIVE_TASKS_CEILING, derived)
+
+    def _max_post_candidate_tasks(self) -> int:
+        """Cap on tasks past the candidate race (review, recording, submission).
+
+        They hold no candidate container, so they do not count against
+        ``_max_active_tasks``; this only keeps CPU, disk and screen recording
+        on this machine from piling up.
+        """
+        return clamp_int(self._automation_cfg().get("maxPostCandidateTasks"), 1, MAX_ACTIVE_TASKS_CEILING,
+                         DEFAULT_MAX_POST_CANDIDATE_TASKS)
 
     def sync_skill_limits(self) -> bool:
         """Push ``maxContainers`` / ``excludedProjectCodes`` to the skill."""
@@ -1443,7 +1965,23 @@ class QueueManager:
         state = read_json(task_root / "monitor" / "state.json", {})
         return str(state.get("status") or "") if isinstance(state, dict) else ""
 
+    @staticmethod
+    def _job_awaiting_qc(job: dict[str, Any]) -> bool:
+        """Whether the task is already submitted and only polling for the QC verdict.
+
+        ``submit_api.py`` writes ``submitted_polling`` before it polls (up to 30
+        minutes); the worker is idle then and must not hold an active-task slot.
+        """
+        task_root = JobManager._platform_job_task_root(job)
+        if task_root is None:
+            return False
+        result = read_json(task_root / "monitor" / "submission" / "api-result.json", {})
+        return isinstance(result, dict) and str(result.get("status") or "") in QC_WAITING_SUBMISSION_STATUSES
+
     def _job_task_terminal(self, job: dict[str, Any]) -> bool:
+        """Whether a job no longer counts toward the active-task cap."""
+        if self._job_awaiting_qc(job):
+            return True
         if job.get("status") == "running" and persisted_job_process_alive(job):
             return False
         return self._job_task_status(job) in TERMINAL_TASK_STATUSES
@@ -1558,6 +2096,32 @@ class QueueManager:
             "error": error,
         }
 
+    def _running_candidates(self, docker: dict[str, Any]) -> tuple[dict[str, int], list[str], list[str]]:
+        """Running candidate containers: per-task counts, counted groups, foreign names."""
+        group_container_counts: dict[str, int] = {}
+        # Candidates started by other tools (same key) share the limit too.
+        foreign_containers: list[str] = []
+        for item in docker.get("items") or []:
+            if not isinstance(item, dict) or str(item.get("state") or "").lower() != "running":
+                continue
+            if not self._is_candidate_container(item):
+                continue
+            group = self._container_group_name(item.get("name"))
+            if group:
+                group_container_counts[group] = group_container_counts.get(group, 0) + 1
+            elif str(item.get("name") or "").strip():
+                foreign_containers.append(str(item.get("name")).strip())
+        non_test_groups = [group for group in sorted(group_container_counts) if not self._group_is_excluded(group)]
+        foreign_containers = sorted(name for name in foreign_containers if not self._group_is_excluded(name))
+        return group_container_counts, non_test_groups, foreign_containers
+
+    def _post_candidate_keys(self, jobs: list[dict[str, Any]]) -> list[str]:
+        return [
+            str(job.get("key") or "")
+            for job in jobs
+            if job.get("source") == "platform" and self._job_candidate_phase_finished(job)
+        ]
+
     def _capacity_usage_locked(self, startup_timeout: int) -> tuple[int, dict[str, Any]]:
         # Every running job counts, whichever folder it lives in; see
         # _queue_reservation_jobs_locked.
@@ -1588,6 +2152,7 @@ class QueueManager:
             detail = self._base_capacity_detail("jobs")
             detail["estimatedNonTestContainers"] = sum(self._job_estimated_containers(job) for job in active_jobs)
             detail["activeJobKeys"] = [str(job.get("key") or "") for job in active_jobs]
+            detail["postCandidateJobKeys"] = self._post_candidate_keys(active_jobs)
             return len(active_jobs), detail
 
         docker = self.docker_cache.get()
@@ -1599,25 +2164,12 @@ class QueueManager:
             detail = self._base_capacity_detail("fallback", str(docker.get("error") or ""))
             detail["estimatedNonTestContainers"] = sum(self._job_estimated_containers(job) for job in active_jobs)
             detail["activeJobKeys"] = [str(job.get("key") or "") for job in active_jobs]
+            detail["postCandidateJobKeys"] = self._post_candidate_keys(active_jobs)
             return len(active_jobs), detail
 
-        group_container_counts: dict[str, int] = {}
-        # Candidates started by other tools (same key) share the limit too.
-        foreign_containers: list[str] = []
-        for item in docker.get("items") or []:
-            if not isinstance(item, dict) or str(item.get("state") or "").lower() != "running":
-                continue
-            if not self._is_candidate_container(item):
-                continue
-            group = self._container_group_name(item.get("name"))
-            if group:
-                group_container_counts[group] = group_container_counts.get(group, 0) + 1
-            elif str(item.get("name") or "").strip():
-                foreign_containers.append(str(item.get("name")).strip())
+        group_container_counts, non_test_groups, foreign_containers = self._running_candidates(docker)
         container_groups = sorted(group_container_counts)
         group_set = set(container_groups)
-        non_test_groups = [group for group in container_groups if not self._group_is_excluded(group)]
-        foreign_containers = sorted(name for name in foreign_containers if not self._group_is_excluded(name))
         non_test_containers = sum(group_container_counts[group] for group in non_test_groups) + len(foreign_containers)
 
         # Container demand = running containers + what each live task still
@@ -1627,18 +2179,35 @@ class QueueManager:
         # files: placeholders were counted by the skill's limiter too, so a
         # freshly claimed task's candidates queued behind its own placeholders.
         pending_demand = 0
+        # The part of pending_demand that is candidates already waiting in the
+        # skill's limiter; the rest is tasks still initialising.
+        queued_candidates = 0
         active_tasks = 0
         startup_reservations: list[str] = []
         active_job_keys: list[str] = []
+        post_candidate_keys: list[str] = []
         # The skill's limiter hands a free slot to a queued candidate within
         # seconds.  A candidate still marked ``running`` without a container
         # while the limit has room belongs to a task whose executor is gone; its
         # demand would otherwise block launches until the orphan grace expires.
         limit = self._max_containers_limit()
-        has_room = non_test_containers < limit
+        # Room is judged the way the skill's limiter judges it: a slot granted
+        # to a candidate whose ``docker run`` has not finished yet is taken.
+        # Counting running containers only read "5/6, room" while the limiter
+        # was full, and every task queued behind it was declared phantom.
+        excluded_codes = self._excluded_project_codes()
+        granted = [
+            entry for entry in self.slots.snapshot().get("occupied") or []
+            if str(entry.get("projectCode") or "").casefold() not in excluded_codes
+            and not self._group_is_excluded(self._container_group_name(entry.get("container")) or "")
+        ]
+        has_room = non_test_containers + len(granted) < limit
         phantom_after = self._phantom_demand_seconds()
         starved_now: set[str] = set()
+        queued_now: set[str] = set()
         phantom: list[str] = []
+        starved_alive: list[str] = []
+        now = time.time()
         for job in running_jobs:
             key = str(job.get("key") or "")
             if self._job_is_excluded(job):
@@ -1664,15 +2233,41 @@ class QueueManager:
                 continue
             active_tasks += 1
             active_job_keys.append(key)
+            if self._job_candidate_phase_finished(job):
+                post_candidate_keys.append(key)
             demand = self._job_container_demand(job, task_root, startup_timeout=startup_timeout)
             running_here = group_container_counts.get(matched_group, 0) if matched_group else 0
             extra = max(0, demand - running_here)
             label = task_name or key
             initialised = task_root is not None and (task_root / "monitor" / "state.json").is_file()
+            if extra:
+                queued_now.add(label)
+                last = self._queued_last.get(label)
+                # Gaps (a restart, a long tick) are not counted as waiting.
+                if last is not None:
+                    self._queued_seconds[label] = self._queued_seconds.get(label, 0.0) + min(60.0, max(0.0, now - last))
+                self._queued_last[label] = now
             if extra and has_room and initialised:
                 starved_now.add(label)
-                waited = time.time() - self._starved_since.setdefault(label, time.time())
-                if waited >= phantom_after:
+                waited = now - self._starved_since.setdefault(label, now)
+                if waited >= phantom_after and self._candidate_runner_alive(task_root):
+                    # Its executor is alive, so the demand is real: keep
+                    # counting it.  Dropping it here started a new task every
+                    # ten minutes while all 20 executors were still queueing.
+                    starved_alive.append(label)
+                    if label not in self._starved_logged:
+                        self._starved_logged.add(label)
+                        self._emit(
+                            "warning",
+                            "queue.candidate_starved",
+                            projectCode=str(job.get("projectCode") or ""),
+                            detail=(
+                                f"{label} 有 {extra} 个候选 {int(waited)} 秒未拿到容器"
+                                f"（容器 {non_test_containers} + 已分配 {len(granted)} / {limit}），"
+                                "执行进程仍存活，继续计入占用"
+                            ),
+                        )
+                elif waited >= phantom_after:
                     phantom.append(label)
                     if label not in self._phantom_logged:
                         self._phantom_logged.add(label)
@@ -1689,11 +2284,17 @@ class QueueManager:
             if extra:
                 pending_demand += extra
                 startup_reservations.append(label)
+                if self._candidates_started(task_root):
+                    queued_candidates += extra
 
         for label in list(self._starved_since):
             if label not in starved_now:
                 self._starved_since.pop(label, None)
                 self._phantom_logged.discard(label)
+                self._starved_logged.discard(label)
+        for label in list(self._queued_last):
+            if label not in queued_now:
+                self._queued_last.pop(label, None)
 
         return active_tasks, {
             "mode": "containers",
@@ -1703,13 +2304,44 @@ class QueueManager:
             "nonTestContainerCount": non_test_containers,
             "foreignContainers": foreign_containers,
             "pendingContainerDemand": pending_demand,
+            "queuedCandidates": queued_candidates,
             "estimatedNonTestContainers": non_test_containers + pending_demand,
             "excludedProjectCodes": sorted(self._excluded_project_codes()),
             "startupReservations": sorted(startup_reservations),
             "phantomDemand": sorted(phantom),
+            "starvedDemand": sorted(starved_alive),
+            "grantedSlots": len(granted),
             "activeJobKeys": active_job_keys,
+            "postCandidateJobKeys": post_candidate_keys,
             "error": "",
         }
+
+    @staticmethod
+    def _candidate_runner_alive(task_root: Path | None) -> bool:
+        """Whether a ``running`` candidate's executor process still exists.
+
+        ``runPid`` is the skill's ``run`` process that queues for a slot.  The
+        queue worker's pid says nothing here: it outlives the executor.  Old
+        state files without ``runPid`` keep the time-only judgement.
+        """
+        if task_root is None:
+            return False
+        state = read_json(task_root / "monitor" / "state.json", {})
+        candidates = state.get("candidates") if isinstance(state, dict) else None
+        if not isinstance(candidates, dict):
+            return False
+        return any(
+            isinstance(record, dict)
+            and str(record.get("status") or "") == "running"
+            and pid_alive(record.get("runPid"))
+            for record in candidates.values()
+        )
+
+    @staticmethod
+    def _candidates_started(task_root: Path | None) -> bool:
+        """Whether the task has candidate records, i.e. is past initialisation."""
+        state = read_json(task_root / "monitor" / "state.json", {}) if task_root is not None else {}
+        return isinstance(state, dict) and isinstance(state.get("candidates"), dict) and bool(state["candidates"])
 
     def _job_container_demand(self, job: dict[str, Any], task_root: Path | None, *, startup_timeout: int) -> int:
         """How many candidate containers a live task needs right now."""
@@ -1761,6 +2393,15 @@ class QueueManager:
         others = sorted(str(item["name"]).strip() for item in running if not self._is_candidate_container(item))
         counted = int(detail.get("nonTestContainerCount") or 0)
         foreign = list(detail.get("foreignContainers") or [])
+        groups = detail.get("containerGroups") or []
+        stale = not bool(detail.get("dockerReady")) and bool(docker.get("stale"))
+        if stale:
+            # ``docker ps`` failed (usually timed out under load).  The gate
+            # already falls back to counting jobs; the card shows the last good
+            # listing instead of reading "0" while candidates are running.
+            group_counts, counted_groups, foreign = self._running_candidates(docker)
+            counted = sum(group_counts[group] for group in counted_groups) + len(foreign)
+            groups = sorted(group_counts)
         slots = self.slots.snapshot()
         hard_limit = self._max_containers_limit()
         # The same numbers the launch gate uses: containers still needed by
@@ -1781,10 +2422,12 @@ class QueueManager:
             "used": counted + reserved,
             "phantom": detail.get("phantomDemand") or [],
             "hardLimit": hard_limit,
-            "groups": detail.get("containerGroups") or [],
+            "groups": groups,
             "slots": slots.get("occupied") or [],
             "dockerReady": bool(detail.get("dockerReady")),
             "dockerError": str(detail.get("error") or docker.get("error") or ""),
+            "stale": stale,
+            "staleSeconds": docker.get("staleSeconds") if stale else None,
             "scheduleMode": self._schedule_mode(),
         }
 
@@ -1821,7 +2464,7 @@ class QueueManager:
             prompt_template = str(self._automation_cfg().get("promptTemplate") or "")
             mode = self._schedule_mode()
             max_tasks = capacity
-            max_containers = self._max_containers_limit()
+            max_containers = self._base_containers_limit()
             candidates_per_task = self._candidates_per_task()
             startup_timeout = self._startup_timeout()
             reconcile_seconds = clamp_int(self._automation_cfg().get("reconcileSeconds"), 15, 3600, DEFAULT_RECONCILE_SECONDS)
@@ -1848,6 +2491,10 @@ class QueueManager:
             "capacity": capacity,
             "maxContainers": max_containers,
             "maxTasks": max_tasks,
+            "maxActiveTasks": self._max_active_tasks(),
+            "maxPostCandidateTasks": self._max_post_candidate_tasks(),
+            "effectiveMaxContainers": self._max_containers_limit(),
+            "elastic": self.elastic_status(),
             "candidatesPerTask": candidates_per_task,
             "scheduleMode": mode,
             "startupTimeoutSeconds": startup_timeout,
@@ -1873,6 +2520,7 @@ class QueueManager:
             "projectReuse": self.project_reuse(),
             "projectUsage": self._project_usage_status(),
             "disk": self.disk_status(),
+            "throughput": self.throughput_stats(),
             "capacityMode": "fast",
             "containerGroups": [],
             "startupReservations": [],
@@ -2023,8 +2671,12 @@ class QueueManager:
             "roots": roots,
             "activeRoots": active_roots,
             "capacity": int(self._automation_cfg().get("capacity") or 2),
-            "maxContainers": self._max_containers_limit(),
+            "maxContainers": self._base_containers_limit(),
             "maxTasks": int(self._automation_cfg().get("capacity") or 2),
+            "maxActiveTasks": self._max_active_tasks(),
+            "maxPostCandidateTasks": self._max_post_candidate_tasks(),
+            "effectiveMaxContainers": self._max_containers_limit(),
+            "elastic": self.elastic_status(),
             "candidatesPerTask": self._candidates_per_task(),
             "scheduleMode": self._schedule_mode(),
             "startupTimeoutSeconds": startup_timeout,
@@ -2067,6 +2719,7 @@ class QueueManager:
             "projectReuse": self.project_reuse(),
             "projectUsage": self._project_usage_status(),
             "disk": self.disk_status(),
+            "throughput": self.throughput_stats(),
             "capacityMode": capacity_detail.get("mode"),
             "containerGroups": capacity_detail.get("containerGroups") or [],
             "startupReservations": capacity_detail.get("startupReservations") or [],
@@ -2589,6 +3242,7 @@ class QueueManager:
                 "orphaned": False,
                 "capacityHeld": False,
             })
+            self._record_outcome(item, "failed")
 
         def requeue_stalled(item: dict[str, Any], *, stalled_seconds: float) -> None:
             retry_count = int(item.get("stalledRetryCount") or 0) + 1
@@ -2618,6 +3272,7 @@ class QueueManager:
                 "terminalSignature": "",
                 "terminalSeenAt": "",
                 "containerWait": "",
+                "containerWaitKind": "",
                 "nextAttemptAt": "",
                 "runKey": uuid.uuid4().hex[:10],
                 "stalledRetryCount": retry_count,
@@ -2740,6 +3395,7 @@ class QueueManager:
                         "capacityHeld": False,
                         "slotMarkers": [],
                     })
+                    self._record_outcome(item, "done")
                     if item_id:
                         remove_ids.add(item_id)
                         triggered_ids.add(item_id)
@@ -3056,7 +3712,11 @@ class QueueManager:
         with self._lock:
             startup_timeout = self._startup_timeout()
             self.jobs.reap_stale_platform_jobs(startup_timeout)
+            for job in self.jobs.reap_dead_jobs():
+                self._emit("info", "queue.worker_exited", platformItemId=job.get("platformItemId"),
+                           detail=f"执行器 pid {job.get('pid')} 已退出（{job.get('status')}），释放活跃任务名额")
             self._sync_running_locked()
+            self._refresh_prompt_pin_locked()
             stopped_changed = False
             for item in self._items:
                 if item.get("status") != "pending" or item.get("source") != "platform":
@@ -3071,6 +3731,9 @@ class QueueManager:
                     stopped_changed = True
             if stopped_changed:
                 self._save()
+            # Before the pause/spacing returns: a 429 must lower the limit even
+            # while nothing is being launched.
+            self._elastic_step_locked()
             if bool(self._automation_cfg().get("paused", True)):
                 return actions
 
@@ -3121,9 +3784,16 @@ class QueueManager:
             # second lost one prompt and left an empty task directory behind.
             spacing = max(MIN_LAUNCH_SPACING_SECONDS, int(self._automation_cfg().get("cooldownSeconds") or 0))
             last_started = parse_time(self._lastStartedAt)
-            if last_started and time.time() - last_started.timestamp() < spacing:
-                ready_at = iso_from_timestamp(last_started.timestamp() + spacing)
-                return hold(f"启动间隔 {spacing} 秒，约 {ready_at[11:19]} UTC 后启动下一个", "spacing")
+            since_last = time.time() - last_started.timestamp() if last_started else None
+            # Container mode may skip the configured interval while a whole
+            # batch of containers is still unclaimed; checked once capacity is known.
+            spacing_deferred = False
+            if since_last is not None and since_last < spacing:
+                if mode == SCHEDULE_MODE_CONTAINERS and since_last >= MIN_LAUNCH_SPACING_SECONDS:
+                    spacing_deferred = True
+                else:
+                    ready_at = iso_from_timestamp(last_started.timestamp() + spacing)
+                    return hold(f"启动间隔 {spacing} 秒，约 {ready_at[11:19]} UTC 后启动下一个", "spacing")
             free = self.disk_free_gb()
             min_free = housekeeping_settings(self.config)["minFreeGB"]
             if free is not None and free < min_free:
@@ -3146,6 +3816,22 @@ class QueueManager:
                 self._docker_down = False
                 self._emit("info", "queue.docker_recovered", detail="Docker 状态已恢复")
 
+            # The monitor and the skill must enforce the same limit.  Another
+            # writer changed container-limit.json once and the two sides
+            # disagreed for hours; fix it and wait for executors to reread it.
+            skill_limit = self.skill_limit_status()
+            if not skill_limit.get("inSync"):
+                self.sync_skill_limits()
+                self._skill_limit_resynced_at = time.time()
+                self._emit("warning", "config.skill_limit_drift",
+                           detail=(
+                               f"技能侧容器上限为 {skill_limit.get('maxContainers')}，"
+                               f"与监控台 {self._max_containers_limit()} 不一致，已改回"
+                           ))
+            resync_wait = SKILL_SETTINGS_REFRESH_SECONDS - (time.time() - self._skill_limit_resynced_at)
+            if resync_wait > 0:
+                return hold(f"技能侧容器上限刚被纠正，约 {int(resync_wait)} 秒后执行器全部生效再启动", "gate")
+
             hard_limit = self._max_containers_limit()
             batch = self._candidates_per_task()
             # Running containers plus the containers live tasks still need
@@ -3153,6 +3839,14 @@ class QueueManager:
             estimated_current = int(capacity_detail.get("estimatedNonTestContainers") or 0)
             non_test = int(capacity_detail.get("nonTestContainerCount") or 0)
             pending_demand = int(capacity_detail.get("pendingContainerDemand") or 0)
+            queued_candidates = int(capacity_detail.get("queuedCandidates") or 0)
+            max_active = self._max_active_tasks()
+            post_active = len(capacity_detail.get("postCandidateJobKeys") or [])
+            max_post = self._max_post_candidate_tasks()
+            race_in_use = max(0, capacity_in_use - post_active)
+
+            if mode == SCHEDULE_MODE_CONTAINERS:
+                self._check_oversubscribed(race_in_use, max_active, queued_candidates, hard_limit)
 
             if mode == SCHEDULE_MODE_TASKS:
                 # Task-count mode: the number of live tasks is the only gate;
@@ -3160,11 +3854,39 @@ class QueueManager:
                 if capacity_in_use >= capacity:
                     self._capacity_saturated = True
                     return hold(f"并行任务已满：{capacity_in_use}/{capacity}，有空位自动启动", "capacity")
+            elif race_in_use >= max_active:
+                # No estimate may bypass this: every task before the end of
+                # its candidate race counts, initialising ones included.
+                self._capacity_saturated = True
+                return hold(
+                    f"候选阶段任务已满：{race_in_use}/{max_active}（另有 {post_active} 个在评审/录屏/提交），"
+                    "有任务跑完候选赛后自动启动",
+                    "capacity",
+                )
+            elif post_active >= max_post:
+                self._capacity_saturated = True
+                return hold(
+                    f"已过候选赛的任务已满：{post_active}/{max_post}（评审、录屏、提交占本机资源），有任务结束后自动启动",
+                    "capacity",
+                )
+            elif queued_candidates > 0:
+                # Finish what has started first: a new task's candidates would
+                # compete for the same slots with the ones already queued.
+                # Tasks still initialising are not queued: their batch is only
+                # reserved by the estimate below, or each launch would wait out
+                # the previous task's ~10 minute setup with slots sitting empty.
+                return hold(f"已有 {queued_candidates} 个候选在排队等容器，先让已启动的任务拿到容器", "capacity")
             elif hard_limit > 0 and estimated_current + 1 > hard_limit:
                 # Container mode: start as soon as one slot is free.  Requiring
                 # room for the whole batch made the count oscillate 2↔4 against
                 # a limit of 4; the skill's limiter queues the overflow.
                 return hold(f"容器名额已满：运行中 {non_test} + 待启动 {pending_demand} / 上限 {hard_limit}，有空位自动启动", "capacity")
+            if spacing_deferred and not (mode == SCHEDULE_MODE_CONTAINERS and hard_limit > 0
+                                         and estimated_current + batch <= hard_limit):
+                # Containers first: the interval only paces the last batch, so
+                # 4 empty containers no longer wait 2 × 210 s plus setup.
+                ready_at = iso_from_timestamp(last_started.timestamp() + spacing)
+                return hold(f"启动间隔 {spacing} 秒，约 {ready_at[11:19]} UTC 后启动下一个", "spacing")
 
             try:
                 self.jobs.validate_platform_runner()
@@ -3187,7 +3909,7 @@ class QueueManager:
                 if mode == SCHEDULE_MODE_TASKS:
                     if capacity_in_use >= capacity:
                         break
-                elif hard_limit > 0 and estimated_current + 1 > hard_limit:
+                elif race_in_use >= max_active or (hard_limit > 0 and estimated_current + 1 > hard_limit):
                     break
                 if item.get("status") != "pending":
                     continue
@@ -3217,6 +3939,7 @@ class QueueManager:
                         "orphaned": False,
                         "error": "",
                         "containerWait": "",
+                        "containerWaitKind": "",
                         "slotMarkers": [],
                         "slotReservedAt": "",
                     })
@@ -3271,6 +3994,7 @@ class QueueManager:
                     self._lastStartedAt = utc_now()
                     actions.append({"item": copy.deepcopy(item), "job": job})
                     capacity_in_use += 1
+                    race_in_use += 1
                     estimated_current += batch
                     if capacity_in_use >= capacity:
                         self._capacity_saturated = True
@@ -3310,6 +4034,14 @@ class QueueManager:
                 break
             self._save()
         return actions
+
+    def _check_oversubscribed(self, active: int, max_active: int, pending: int, limit: int) -> None:
+        """Log once when more is in flight than the gates should ever allow."""
+        over = active > max_active or (limit > 0 and pending > limit)
+        if over and not self._oversubscribed:
+            self._emit("warning", "queue.oversubscribed",
+                       detail=f"活跃任务 {active}/{max_active}，排队候选 {pending}（容器上限 {limit}）")
+        self._oversubscribed = over
 
     # -- quota settlement at claim ---------------------------------------- #
     def claim_quota(self, item: dict[str, Any], platform: Any) -> dict[str, Any]:

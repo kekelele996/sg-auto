@@ -232,7 +232,11 @@ class SchedulerService:
             int(monitor_cfg.get("traceMaxBytes") or 16 * 1024 * 1024),
             lightweight=not bool(monitor_cfg.get("parseTraceOnSnapshot", False)),
         )
-        self.docker_cache = DockerCache(float(monitor_cfg.get("dockerCacheSeconds") or 2.0))
+        self.docker_cache = DockerCache(
+            float(monitor_cfg.get("dockerCacheSeconds") or 2.0),
+            timeout=float(monitor_cfg.get("dockerTimeoutSeconds") or 20.0),
+            error_ttl=float(monitor_cfg.get("dockerErrorCacheSeconds") or 5.0),
+        )
         # ``_stateDir`` redirects every piece of persisted state (tests set it).
         # Without this the suite wrote into the live queue, log and slot ledger.
         custom_state = str(config.get("_stateDir") or "").strip()
@@ -961,6 +965,32 @@ class SchedulerService:
                 raise MonitorError(f"最大容器数必须在 1 到 {SKILL_ABSOLUTE_MAX_CONTAINERS} 之间（技能侧硬顶）")
             automation["maxContainers"] = value
             changes.append(f"maxContainers={value}")
+        if "maxActiveTasks" in payload:
+            # Empty/0 goes back to the default derived from maxContainers.
+            value = int(payload.get("maxActiveTasks") or 0)
+            if value < 0 or value > 50:
+                raise MonitorError("容器模式活跃任务上限必须在 1 到 50 之间（0 表示自动）")
+            if value:
+                automation["maxActiveTasks"] = value
+            else:
+                automation.pop("maxActiveTasks", None)
+            changes.append(f"maxActiveTasks={value or 'auto'}")
+        reset_elastic = False
+        if isinstance(payload.get("elasticContainers"), dict):
+            wanted = payload["elasticContainers"]
+            elastic = automation.setdefault("elasticContainers", {})
+            if "enabled" in wanted:
+                enabled = bool(wanted.get("enabled"))
+                if enabled != bool(elastic.get("enabled")):
+                    reset_elastic = True
+                elastic["enabled"] = enabled
+                changes.append(f"elastic={'on' if enabled else 'off'}")
+            if "ceiling" in wanted:
+                value = int(wanted.get("ceiling") or 0)
+                if value < 1 or value > SKILL_ABSOLUTE_MAX_CONTAINERS:
+                    raise MonitorError(f"弹性容器上限必须在 1 到 {SKILL_ABSOLUTE_MAX_CONTAINERS} 之间（技能侧硬顶）")
+                elastic["ceiling"] = value
+                changes.append(f"elasticCeiling={value}")
         if "candidatesPerTask" in payload:
             value = int(payload.get("candidatesPerTask") or 0)
             if value < 2 or value > 8:
@@ -977,6 +1007,8 @@ class SchedulerService:
             raise MonitorError("没有需要更新的上限参数")
         prune_legacy_automation(automation)
         self._persist_config()
+        if reset_elastic or any(change.startswith("maxContainers=") for change in changes):
+            self.queue.reset_elastic()
         self.queue.sync_skill_limits()
         self.log.emit("config.limits", detail="，".join(changes))
         return self.queue.fast_snapshot()
@@ -1697,6 +1729,7 @@ class SchedulerService:
             "lastReconcileAt": self.reconcile.last_run_at,
             "loops": self.health.snapshot(),
             "healthy": self.health.healthy(),
+            "throughput": self.queue.throughput_stats(),
         }
 
 

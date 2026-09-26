@@ -115,7 +115,7 @@ static/              app.css / app.js + 四个页面，原生 JS，无构建链
 | `containers`（容器优先，默认） | 运行中的候选容器数 | 并行任务数 | Key 并发是瓶颈，想让容器跑满 |
 | `tasks`（任务数量优先） | 并行任务数 | 运行中的候选容器数 | 想控制同时进行的题目数 |
 
-**容器数只在监控台设置一处**（队列管理页「最大容器数」，1–6）。监控台启动时和每次保存都会把
+**容器数只在监控台设置一处**（队列管理页「最大容器数」，1–8）。监控台启动时和每次保存都会把
 它连同 `excludedProjectCodes` 写入技能读取的 `~/.codex/sologsb-0917/container-limit.json`，并带
 `managedBy: sologsb-monitor` 标记；技能的 `_ContainerLimiter` 看到这个标记时优先使用它，
 不再被设备配置 `claude.maxContainers` 覆盖。队列页会显示技能侧是否已同步。
@@ -231,9 +231,11 @@ claimed  → refunded  失败/中止，POST /api/v1/tasks/{id}/cancel 回补，�
 - `roots` / `monitor.activeRoots`：任务扫描根目录 / 其中实际参与扫描与启动的子集。
 - `server.host` / `server.port` / `server.allowRemoteActions`。
 - `automation.scheduleMode`：`containers` 或 `tasks`。
-- `automation.maxContainers`：唯一的容器上限（1–6），同步给技能。
+- `automation.maxContainers`：唯一的容器上限（1–8），同步给技能。
 - `automation.candidatesPerTask`：单任务候选数（2–8）。
 - `automation.capacity`（= `maxTasks`）：仅任务数量优先模式生效。
+- `automation.maxActiveTasks`：容器模式下同时在跑的任务数上限（1–50），只作兜底，不设时取 `2 × ceil(容器上限 / candidatesPerTask) + 1`（5 容器 / 2 候选 → 7）：任务只在候选赛（中位 49 分钟）占容器，收尾（中位 42 分钟）不占，填满容器约需两倍批次的任务。容器模式只在「活跃任务未满、没有候选在排队等容器、至少空 1 个容器名额」时启动新任务。完成/失败的任务各阶段耗时记在 `.state/outcomes.json`，24 小时吞吐见 `/api/health` 的 `throughput` 与队列接口。
+- `automation.elasticContainers`：弹性容器上限，默认关闭。打开后 `maxContainers` 是保底值，按 429 实际耽误的时间调整，而不是数 429 条数（0925/0926 两天 153 次 429，七成首次重试半秒内就过，合计只多等 6 分钟）：近 5 分钟候选 `stdout.jsonl` 里 429 `api_retry` 的 `retry_delay_ms` 之和占「容器数 × 5 分钟」超过 `stallPercent`（3%），或单个请求重试到第 `severeAttempt`（6）次，就 −1（两次下调至少隔 180 秒），不低于保底；容器已满、有任务在等、等待占比低于阈值一半、距上次下调超过 `cooldownSeconds`（600）时，每 `stepUpSeconds`（300）+1，直到 `ceiling`（默认 8，技能硬顶）。某个上限容器全满、无压力地保持 `stableSeconds`（1800）后，按「一天中的小时」记下来，下调时也记下调后的值（保留 7 天）；之后进入同一小时、切换开关或改保底时直接从学到的值开始，不再从保底一格格爬。当前值写进 `container-limit.json` 同步给技能，状态在 `.state/elastic.json`，事件 `elastic.up` / `elastic.down` / `elastic.resume` / `elastic.rate_limited_at_floor`。
 - `automation.cooldownSeconds`：启动间隔（最低 20 秒）。
 - `automation.pauseOnStart`（默认 `crash-loop`）：重启时如何处理上次的 `paused`。`crash-loop` 沿用上次状态（记 `config.resumed_on_start`），只有 15 分钟内异常退出 ≥ 2 次（上一个进程没走 `stop()`）才暂停并记 `config.paused_on_start`；启动记录在 `.state/starts.json`。`always`（旧值 `true`）每次都暂停，`never`（旧值 `false`）总是沿用。
 - `automation.waitTimeoutSeconds`：queue_worker 等桌面任务结束的上限，线上设为 14 小时（39% 的正常任务超过 4 小时）；真正卡住的交给兜底策略的「无进展」。

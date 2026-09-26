@@ -452,14 +452,23 @@ def read_trace_stats(path: Path | None, *, event_limit: int = 400, max_bytes: in
 class DockerCache:
     """``docker ps`` snapshot with a short TTL.
 
-    A failing ``docker`` call is not cached: the old cache stored the error for
-    the whole TTL, which stalled the queue for two seconds per transient failure.
+    A failing ``docker`` call is cached only for ``error_ttl``: storing it for
+    the whole TTL stalled the queue per transient failure, while not caching it
+    at all re-ran ``docker ps`` on every call.  Under load ``docker ps`` took
+    15-25 s, each caller hit the timeout on its own and the piled-up listings
+    kept the daemon slow.  Only one listing runs at a time; callers arriving
+    meanwhile wait for its result instead of starting another.
     """
 
-    def __init__(self, ttl: float = 2.0):
+    def __init__(self, ttl: float = 2.0, *, timeout: float = 20.0, error_ttl: float = 0.0):
         self.ttl = max(0.0, float(ttl))
+        self.timeout = max(1.0, float(timeout))
+        self.error_ttl = max(0.0, float(error_ttl))
         self._lock = threading.Lock()
+        self._fetch_lock = threading.Lock()
         self._at = 0.0
+        # Monotonic time of the last successful listing (0 = never).
+        self._ok_at = 0.0
         self._data: dict[str, Any] = {"items": [], "byName": {}, "error": ""}
 
     @staticmethod
@@ -470,15 +479,14 @@ class DockerCache:
         except (TypeError, ValueError):
             return {}
 
-    @staticmethod
-    def _ps(*scope: str) -> subprocess.CompletedProcess | str:
+    def _ps(self, *scope: str) -> subprocess.CompletedProcess | str:
         """Run ``docker ps``; return the failure text instead of raising."""
         try:
             return subprocess.run(
                 ["docker", "ps", *scope, "--no-trunc", "--format", "{{json .}}"],
                 capture_output=True,
                 text=True,
-                timeout=8,
+                timeout=self.timeout,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -519,31 +527,42 @@ class DockerCache:
                 by_name[item["name"]] = item
         return {"items": items, "byName": by_name, "error": ""}
 
+    def _fresh_locked(self, now: float) -> bool:
+        if self._data.get("fetchedOk"):
+            return now - self._at < self.ttl
+        return bool(self._at) and now - self._at < self.error_ttl
+
     def get(self, force: bool = False) -> dict[str, Any]:
-        now = time.monotonic()
+        requested = time.monotonic()
         with self._lock:
-            cached = self._data
-            if not force and cached.get("fetchedOk") and now - self._at < self.ttl:
-                return copy.deepcopy(cached)
-        data = self._fetch()
-        if data.get("error"):
-            # Keep the previous good snapshot visible but report the error so the
-            # scheduler refuses to start work it cannot account for.
+            if not force and self._fresh_locked(requested):
+                return copy.deepcopy(self._data)
+        with self._fetch_lock:
             with self._lock:
-                previous = self._data
-                failed = {
-                    "items": previous.get("items") or [],
-                    "byName": previous.get("byName") or {},
-                    "error": str(data.get("error") or ""),
-                    "stale": True,
-                }
+                # A listing finished while this caller waited: it is as fresh
+                # as one this caller would run, even for ``force``.
+                if self._at >= requested or (not force and self._fresh_locked(time.monotonic())):
+                    return copy.deepcopy(self._data)
+            data = self._fetch()
+            now = time.monotonic()
+            with self._lock:
                 self._at = now
-                self._data = failed
-                return copy.deepcopy(failed)
-        with self._lock:
-            self._at = now
-            self._data = {**data, "fetchedOk": True, "stale": False}
-            return copy.deepcopy(self._data)
+                if data.get("error"):
+                    # Keep the previous good snapshot visible but report the
+                    # error so the scheduler refuses to start work it cannot
+                    # account for.
+                    previous = self._data
+                    self._data = {
+                        "items": previous.get("items") or [],
+                        "byName": previous.get("byName") or {},
+                        "error": str(data.get("error") or ""),
+                        "stale": True,
+                        "staleSeconds": round(now - self._ok_at, 1) if self._ok_at else None,
+                    }
+                else:
+                    self._ok_at = now
+                    self._data = {**data, "fetchedOk": True, "stale": False}
+                return copy.deepcopy(self._data)
 
 
 # --------------------------------------------------------------------------- #
