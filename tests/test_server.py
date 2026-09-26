@@ -171,8 +171,7 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn("tasks", data)
         self.assertIn("queue", data)
         self.assertIn("containers", data)
-        self.assertNotIn("scheduleMode", data["queue"])
-        self.assertIn("maxTasks", data["queue"])
+        self.assertEqual(data["queue"]["scheduleMode"], "containers")
 
     def test_task_events_are_structured(self):
         card = self._get("/api/tasks")[1]["tasks"][0]
@@ -189,9 +188,11 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(any(entry["event"] == "service.started" for entry in data["entries"]))
 
-    def test_automation_mode_switch_is_gone(self):
-        with self.assertRaises(urllib.error.HTTPError):
-            self._post("/api/automation", {"action": "set-schedule-mode", "mode": "tasks"})
+    def test_automation_mode_switch(self):
+        status, data = self._post("/api/automation", {"action": "set-schedule-mode", "mode": "tasks"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["automation"]["scheduleMode"], "tasks")
+        self._post("/api/automation", {"action": "set-schedule-mode", "mode": "containers"})
 
     def test_parallel_resume_is_gone(self):
         """There is no "run both sides at once" action any more.
@@ -363,30 +364,28 @@ class SetLimitsTests(unittest.TestCase):
         (self.root / "tasks").mkdir(parents=True, exist_ok=True)
         config = make_config(self.root)
         config["_configPath"] = str(self.root / "config.json")
-        config["automation"].update({"maxContainers": 5, "capacity": 2})
+        config["automation"].update({"maxContainers": 5, "elasticContainers": {"enabled": True, "ceiling": 8}})
         self.service = SchedulerService(config)
         self.addCleanup(self.service.stop)
 
     def _save(self, **payload):
-        form = {"maxTasks": 3, "maxContainers": 5, "candidatesPerTask": 2, "cooldownSeconds": 210}
+        form = {"maxTasks": 3, "maxContainers": 5, "candidatesPerTask": 2, "cooldownSeconds": 210,
+                "elasticContainers": {"enabled": True, "ceiling": 8}}
         return self.service.automation_action("set-limits", {**form, **payload})
 
-    def test_saved_limits_apply_at_once(self):
+    def test_saving_waives_old_prompt_caps_and_starts_at_the_saved_floor(self):
         queue = self.service.queue
-        snapshot = self._save(maxTasks=4, maxContainers=6)
-        self.assertEqual(snapshot["maxTasks"], 4)
-        self.assertEqual(snapshot["maxContainers"], 6)
-        self.assertEqual(queue._max_tasks(), 4)
+        queue._prompt_pin = {"limit": 4, "tasks": 1, "items": ["platform-old"]}
+        queue._elastic["limit"] = 7
+        snapshot = self._save(maxContainers=6)
+        self.assertEqual(snapshot["effectiveMaxContainers"], 6)
         self.assertEqual(json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["maxContainers"], 6)
 
-    def test_legacy_knobs_are_dropped_on_save(self):
-        self.service.config["automation"]["elasticContainers"] = {"enabled": True}
-        self.service.config["automation"]["maxActiveTasks"] = 7
-        self.service.config["automation"]["waitTimeoutSeconds"] = 50400
-        self._save()
-        self.assertNotIn("elasticContainers", self.service.config["automation"])
-        self.assertNotIn("maxActiveTasks", self.service.config["automation"])
-        self.assertNotIn("waitTimeoutSeconds", self.service.config["automation"])
+    def test_an_unchanged_floor_keeps_the_elastic_limit(self):
+        queue = self.service.queue
+        queue._elastic["limit"] = 7
+        snapshot = self._save(cooldownSeconds=120)
+        self.assertEqual(snapshot["effectiveMaxContainers"], 7)
 
 
 class BackgroundLoopTests(unittest.TestCase):

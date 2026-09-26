@@ -36,10 +36,11 @@
     "cooldownSeconds": 210,
     "startupTimeoutSeconds": 300,
     "terminalStabilitySeconds": 6,
-    "leaseGraceSeconds": 180,
-    "maxContainers": 6,
+    "waitTimeoutSeconds": 43200,
+    "maxContainers": 7,
     "candidatesPerTask": 2,
     "anthropicBaseUrl": "https://llm2.jzxhnh.com",
+    "scheduleMode": "containers",
     "reconcileSeconds": 60,
     "startupGraceSeconds": 100,
     "excludedProjectCodes": [
@@ -60,12 +61,6 @@
       "timeoutSeconds": 30,
       "pausedByGuard": false
     },
-    "dockerProbe": {
-      "enabled": true,
-      "slowSeconds": 60,
-      "intervalSeconds": 300,
-      "unhealthyIntervalSeconds": 60
-    },
     "projectUsage": {
       "enabled": true,
       "limit": 10,
@@ -74,6 +69,8 @@
     },
     "maxAttempts": 3,
     "retryBackoffSeconds": 90,
+    "stalledTaskRetrySeconds": 600,
+    "stalledTaskRetryLimit": 1,
     "autoRefill": {
       "enabled": true,
       "intervalSeconds": 60,
@@ -98,8 +95,9 @@
     "guard": {
       "mode": "enforce",
       "candidatePhaseHours": 6.0,
-      "postPhaseHours": 4,
-      "leakedProcessMinutes": 60
+      "noProgressMinutes": 60,
+      "leakedProcessMinutes": 60,
+      "postPhaseHours": 4
     },
     "housekeeping": {
       "enabled": true,
@@ -108,11 +106,22 @@
       "intervalMinutes": 30
     },
     "promptTemplate": "使用 $sologsb-0917，在监控队列提供的监控工作目录下执行一道完整的 Pair-wise GSB。\n\n环境与额度：\n- Solo Manager 必须使用 {{manager_username}} 对应的有效登录态；否则立即停止。\n- Claude Code Key 等凭据统一从 `~/.codex/sologsb/config.json` 读取，并由技能注入 `SOLOSB_CLAUDE_KEY`；禁止将明文凭据写入任务目录、状态文件、轨迹或日志。\n- 容器名额不写死：由调度监控台动态管理（`~/.codex/sologsb-0917/container-limit.json`，页面修改后随时变化），技能的容器限流器每次启动容器前自动读取并排队。不要自行设定、记录或核对容器上限；上限变化（包括高于以往的数值）属正常，不得据此判定超限或停止任务。\n\n项目接入：\n- 已选定项目：`{{selected_project}}`。非空时必须使用其中的 projectCode 或 projectId 接入，不得静默换题；无法接入时立即停止。\n- 为空时从 Solo Manager 正式选择 `{{task_type}}`、`{{difficulty}}` 项目，记录 taskId、taskNo、variant、选择结果及选择前后配额变化；平台未返回的字段写“平台未返回”，不得猜测。\n- `init` 必须显式传入 `--task-root` 指向监控工作目录下的唯一任务目录，不得依赖当前目录。\n- 仅下载源码不消耗任务配额；未正式选择时，不得伪造配额消耗。\n\n执行门禁：\n- 所有候选共用同一份 UTF-8 题目提示词，字节完全一致；不得选择“代码理解”。\n- 显式执行 `run --side both --candidates {{candidates_per_task}} --attempts 6 --base-url {{base_url}}`，预拉候选并并行运行；前两名按完成顺序映射 A/B。\n- A/B 映射完成后才运行 `github-init` 创建 GitHub `main`、`A`、`B`；两侧语义审核都通过后才允许 `publish` 原子发布产物。\n- 遇到 429 `max_parallel_requests` 时先等待 Key 恢复，不得立即重启；恢复后仍使用新容器、新 Claude home 和新 SessionID，实际尝试次数照记。\n- `end_turn` 不能单独证明完成，必须结合轨迹、diff 和产物语义判断。\n- 每个 A/B 产物必须完成真实依赖准备、测试、生产构建或启动验证，结论绑定轨迹、commit、命令输出或退出码。\n- A/B 分别使用 Terminal.app（Web 题另加独立 Chrome）窗口级录制真实视频，统一 1280x720；失败也保留真实过程，禁止 headless、伪造或只录成功片段。\n- 基础设施或技能门禁失败时立即停止；A/B 产物自身失败可继续保留失败证据，但不得跳过该侧录屏。\n\n最终交付：\n- 最终回复严格使用 `references/final-delivery-format.md` 的八个二级标题，不得增删标题或添加额外说明。\n- Excel(包括2模型 完成情况打分和评价)、字段说明、轨迹和视频均使用绝对路径；视频使用 Markdown 图片语法内嵌 。\n- gsb文案中出现的点必须来自于轨迹文件和真实代码，严禁猜测和杜撰。遵从技能要求的gsb文案编写规则",
+    "leaseGraceSeconds": 180,
+    "dockerProbe": {
+      "enabled": true,
+      "slowSeconds": 60,
+      "intervalSeconds": 300,
+      "unhealthyIntervalSeconds": 60
+    },
     "stopTasks": [
       "cy-306-20260919-003553",
       "cy-386-20260919-000745",
       "ld-611-20260919-005026"
-    ]
+    ],
+    "elasticContainers": {
+      "enabled": true,
+      "ceiling": 8
+    }
   },
   "monitor": {
     "pollSeconds": 3,

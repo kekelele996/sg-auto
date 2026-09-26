@@ -4,74 +4,21 @@
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-09-27
+## [1.0.0] - 2026-09-27
 
-本版要点：指定编号前缀的项目优先跑（队列页开关）；任务存活改为租约，判断不了就释放名额；名额只看任务数；Docker 起容器过慢时暂停启动。
+本版要点：调度回到 v0.5.1 的稳定版本，保留「优先项目」功能。v0.6.0 的任务租约判断会把正在排队等容器的任务误判成无活动，
+扣回额度并判为失败，导致多开任务，已整体撤回（代码保留在 `backup/v0.6.0-leasefix` 分支）。
+
+### Changed（回退到 v0.5.1 的调度）
+
+- 撤回 v0.6.0 的任务租约、Docker 启动探测等调度改动，恢复 v0.5.1 的调度、停滞重试和调度模式。
 
 ### Added（优先项目：指定编号前缀的项目先跑）
 
-- 队列页新增「优先项目」开关和编号前缀（`automation.priorityProjects`：`enabled` + `prefixes`，
-  多个前缀用逗号或空格分隔，不分大小写，默认关闭；动作 `set-priority-projects`，记 `config.priority_projects`）。
-- 开启后，编号以这些前缀开头的项目：
-  - 补队时先选，优先于任务类型权重；待办已满（`targetPending`）也照样补进来，普通项目仍按上限补。
-  - 在待办里始终排在普通项目前面，按入队顺序排；补队随机打乱时不动它们。
-  - 跑完释放名额后，下一轮补队再次优先入队，排在同优先级项目后面；额度用完才轮到普通项目。
-- 平台候选列表中优先项目排在最前。保存后立即重排待办并马上补一次队；清空前缀会自动关闭开关。
-
-### Added（Docker 启动探测，过慢时暂停启动）
-
-- 启动新任务前先确认 Docker 能及时起容器：后台用技能镜像 + bind mount 跑一次 `/bin/true`
-  （`automation.dockerProbe`，默认每 5 分钟一次，异常时每 60 秒一次）。
-  一次探测超过 `slowSeconds`（默认 60 秒）或失败就先暂停启动（「Docker 创建容器过慢/失败」），
-  60 秒内再测一次确认；连续 2 次正常后自动继续；记 `queue.docker_slow` / `queue.docker_probe_recovered`。
-  暂停期间不领号、不扣配额，也不改 `automation.paused`，不会和大模型断连守护互相解除暂停。
-  此前 `docker ps` 正常但 OrbStack 过载（空容器 65–75 秒），技能 `docker run` 180 秒超时，
-  启动的任务候选全部 `attempt_invalid`。
-- 空闲很久后的第一次启动，先等一次新的探测结果。
-- 探测状态见 `/api/queue` 的 `dockerProbe`。
-
-### Changed（任务存活改为「租约」，判断不了就释放名额）
-
-- 已提交到桌面的任务，只在以下任一情况成立时占着名额（`QueueManager._task_lease`，原因写在队列项 `lease`）：
-  它的候选容器在跑；`leaseGraceSeconds`（默认 180 秒）内有任何写入（state.json、候选输出、轨迹、
-  执行器结果和日志、ChatGPT rollout）；桌面会话的这一轮还没结束且 2 小时内有写入；
-  还没创建任务目录时执行器仍在提交。都不成立就停执行器、退配额、释放名额，记 `queue.lease_expired`，
-  任务标 `failed`（不自动重试）；此时若 state.json 已是 gsb_ready 等终态，照常记完成。
-- 执行器退出但租约仍在的任务保持 `triggered` 占名额，不再变成 `orphaned` 并一直卡着；
-  启动阶段执行器消失按普通失败处理。旧的 `orphaned` 队列项同样按租约判断，过期即释放。
-- 手动释放也按租约判断：租约仍在时拒绝释放。
-- 删除：停滞重试（`stalledTaskRetrySeconds` / `stalledTaskRetryLimit`）、orphaned 超时释放
-  （`orphanGraceSeconds`）、桌面会话结束宽限（`sessionEndGraceSeconds`），启动时从配置中移除；
-  兜底策略「长时间无进展」（`guard.noProgressMinutes`）及页面上的输入框。
-  这几条路径各自判断「任务还活着吗」，结论互相打架，停滞任务要么占名额数小时，要么被过早重试。
-
-### Changed（名额只留两个数）
-
-- 启动门禁只看「最大任务数」（`automation.capacity`，页面 `maxTasks`，1–20，默认 2）：同时运行的任务数，
-  不分候选赛和评审/录屏/提交阶段，满了显示「并行任务已满：N/M」。
-- 「最大容器数」（`maxContainers`）只写给技能的 `container-limit.json`，由技能的先来先得排队执行；
-  调度不再按容器数、排队候选数暂停启动。启动间隔始终按 `cooldownSeconds`。
-- `container-limit.json` 被改动时照常改回并记 `config.skill_limit_drift`，不再暂停启动 180 秒。
-- 删除：调度模式切换（`scheduleMode`、`set-schedule-mode`）、弹性扩缩容（`elasticContainers`）、
-  两个阶段上限（`maxActiveTasks` / `maxPostCandidateTasks`）、旧提示词写死上限的锁定、失联候选判定
-  （`phantomDemandSeconds`）和超额日志。这些键在启动和保存时从配置中移除；提示词不再有调度模式一行，
-  旧模板里的 `{{schedule_mode}}` 仍可渲染。
-- 线上 `capacity` 3 → 7（原先候选阶段上限为 7）。
-
-### Changed（队列状态只剩四个，阶段按 state.json 显示，按阶段超时）
-
-- 队列项状态只有 `pending` → `running` → `done` / `failed`。旧的 `launching` / `triggered` / `orphaned`
-  读入时并为 `running`（`orphaned` / `orphanedAt` 字段删除），`skipped` 并为 `failed`（原因写进 `error`）；
-  停止名单、手动释放改记 `failed`，本地任务目标侧已完成记 `done`。
-- 队列页的阶段由 state.json 推导：待启动分「排队中 / 等任务名额 / 等待重试」，运行中分
-  「启动中 / 候选赛 / 评审/录屏 / 等质检」，带 `phaseSince`（本阶段已用时）。「需处理」只放被兜底策略标记、
-  或失败仍占名额的任务；去掉 `executing` / `attention` / `skipped` 阶段。
-- 兜底策略新增「评审/录屏阶段超时」（`post-timeout`，`guard.postPhaseHours`，默认 4 小时，1–48）：
-  候选赛结束（`candidateRaceFinishedAt`）后超过上限仍未结束就终止，处理方式同候选阶段超时。
-  默认 4 小时而非 2 小时：09-25/26 正常完成的 119 个任务里，赛后到导出 GSB 超过 2 小时的有 22 个（18%），
-  超过 4 小时的 6 个（5%）。
-- 执行器等待时长不再单独配置：`--wait-timeout` = 候选上限 + 评审上限 + 1 小时（默认 11 小时），
-  只兜底兜底策略管不到的任务。删除 `automation.waitTimeoutSeconds`（线上原为 14 小时），启动和保存时从配置中移除。
+- 队列页新增「优先项目」开关和编号前缀（多个用逗号分隔，不区分大小写），配置项 `automation.priorityProjects`。
+- 开启后匹配的项目优先补队、优先启动；队列已满时仍会补入优先项目；打乱队列时它们保持在最前面。
+- 优先项目跑完再次入队时，排在已在等待的优先项目后面；其他项目在优先项目额度用完后才补入。
+- 新增动作 `set-priority-projects`（`enabled`、`prefixes`）；开启时必须至少有一个前缀，清空前缀会自动关闭。
 
 ## [0.5.1] - 2026-09-26
 

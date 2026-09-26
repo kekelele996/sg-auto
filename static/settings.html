@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>设置 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
-  <link rel="stylesheet" href="/static/app.css?v=0.6.0">
+  <link rel="stylesheet" href="/static/app.css?v=1.0.0">
 </head>
 <body>
 <div class="shell">
@@ -26,7 +26,7 @@
       <select class="input" id="folderSelect"></select>
       <div class="rail-path" id="folderPath"></div>
       <span class="rail-label">调度模式</span>
-      <span class="mode-toggle" id="modeBadge" data-mode="containers"><span class="dot"></span>调度上限</span>
+      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
     </div>
     <div class="rail-foot">
       <div class="rail-foot-row">
@@ -111,7 +111,7 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=0.6.0"></script>
+<script src="/static/app.js?v=1.0.0"></script>
 <script>
   const { $, $$, esc, fetchJson, postJson, fmtClock, fmtDuration, toast,
           initTheme, renderRail, renderMetrics, connectStream, setText, setHtml } = window.SoloApp;
@@ -295,15 +295,18 @@
     const queue = (state.snapshot || {}).queue || {};
     const skill = queue.skillLimit || {};
     setHtml($("#limitsKv"), kvHtml([
-      ["最大任务数", queue.maxTasks],
-      ["最大容器数", `${queue.maxContainers}（技能按先来先得排队）`],
+      ["调度模式", queue.scheduleMode === "tasks" ? "任务数量优先" : "容器优先"],
+      ["最大容器数", queue.maxContainers],
       ["单任务候选数", queue.candidatesPerTask],
+      ["最大任务数", queue.maxTasks],
       ["启动间隔", `${queue.cooldownSeconds || 0} 秒`],
       ["重启后的队列", { never: "沿用上次状态", always: "总是暂停（需手动「启动队列」）" }[queue.pauseOnStart]
         || "沿用上次状态；15 分钟内异常退出 2 次以上才暂停"],
       ["技能执行器", skill.inSync ? `已同步 · 上限 ${skill.maxContainers}` : "未同步"],
     ]));
-    setText($("#modeMeta"), `任务 ${queue.maxTasks} · 容器 ${queue.maxContainers}`);
+    setText($("#modeMeta"), queue.scheduleMode === "containers"
+      ? `容器优先 · 上限 ${queue.maxContainers}`
+      : `任务数量优先 · 并发 ${queue.maxTasks}`);
     setText($("#headMeta"), state.snapshot.generatedAt ? `快照 ${fmtClock(state.snapshot.generatedAt)}` : "");
   }
 
@@ -314,6 +317,17 @@
     renderMetrics(state.snapshot);
     syncForm();
   }
+
+  $("#modeBadge").addEventListener("click", async () => {
+    const current = ((state.snapshot || {}).queue || {}).scheduleMode || "containers";
+    const mode = current === "containers" ? "tasks" : "containers";
+    try {
+      await act("set-schedule-mode", { mode });
+      toast(`调度模式已切换为 ${mode === "containers" ? "容器优先" : "任务数量优先"}`);
+    } catch (error) {
+      toast(`切换失败：${error.message}`, true);
+    }
+  });
 
   /* ------------------------------------------------------------------ scope */
   function renderScope() {

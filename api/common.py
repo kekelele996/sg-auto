@@ -33,9 +33,9 @@ DEFAULT_PAGE_SIZE = 100
 SUBS_TTL = 60
 DEFAULT_PLATFORM_START_TIMEOUT_SECONDS = 300
 DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS = 90
-# A started task keeps its slot while anything of it was written this recently
-# (besides running containers or an open desktop turn); see _task_lease.
-DEFAULT_LEASE_GRACE_SECONDS = 180
+DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS = 12 * 60 * 60
+DEFAULT_STALLED_TASK_RETRY_SECONDS = 10 * 60
+DEFAULT_STALLED_TASK_RETRY_LIMIT = 1
 # The next N pending items the queue page previews; auto refill never
 # reshuffles them, so what the operator sees is what launches next.
 AUTO_REFILL_PREVIEW_SIZE = 10
@@ -51,12 +51,8 @@ MANAGER_TOKEN_SCOPES = [
 ]
 
 SIDES = ("A", "B")
-# A queue item is pending → running → done | failed; what a running task is
-# doing (starting, candidates, review/recording, QC) is read from state.json.
-QUEUE_ACTIVE_STATUSES = {"running"}
-QUEUE_TERMINAL_STATUSES = {"done", "failed"}
-# Statuses older queue files carry: folded into the four above on load.
-LEGACY_QUEUE_STATUSES = {"launching": "running", "triggered": "running", "orphaned": "running", "skipped": "failed"}
+QUEUE_ACTIVE_STATUSES = {"launching", "running", "triggered", "orphaned"}
+QUEUE_TERMINAL_STATUSES = {"done", "failed", "skipped"}
 TASK_FAILURE_STATUSES = {"blocked", "failed", "error"}
 TERMINAL_TASK_STATUSES = {
     "semantic_review_required",
@@ -96,6 +92,12 @@ DEFAULT_KEY_RESERVED_SLOTS = 4
 DEFAULT_MAX_CANDIDATE_CONTAINERS = 4
 DEFAULT_CONTAINER_REFILL_BELOW = 3
 
+# Scheduler modes. ``tasks`` keeps the historical "N tasks in flight" semantics;
+# ``containers`` keeps the running candidate-container count pinned to a target.
+SCHEDULE_MODE_TASKS = "tasks"
+SCHEDULE_MODE_CONTAINERS = "containers"
+SCHEDULE_MODES = (SCHEDULE_MODE_TASKS, SCHEDULE_MODE_CONTAINERS)
+
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 300
 MIN_STARTUP_TIMEOUT_SECONDS = 300
 MAX_STARTUP_TIMEOUT_SECONDS = 600
@@ -108,6 +110,12 @@ DEFAULT_RECONCILE_SECONDS = 60
 # held off for this long while the state is read.
 DEFAULT_STARTUP_GRACE_SECONDS = 100
 DEFAULT_QUOTA_SETTLE_TIMEOUT_SECONDS = 6 * 3600
+DEFAULT_ORPHAN_GRACE_SECONDS = 1800
+# A candidate marked ``running`` that gets no container for this long while the
+# container limit has room is treated as belonging to a dead executor.
+DEFAULT_PHANTOM_DEMAND_SECONDS = 600
+MIN_PHANTOM_DEMAND_SECONDS = 120
+MAX_PHANTOM_DEMAND_SECONDS = 7200
 
 DEFAULT_AUTO_TRIGGER_PROMPT = (
     "使用 `$sologsb-0917`，在监控队列提供的监控工作目录下执行一道完整的 Pair-wise GSB。"
@@ -116,9 +124,9 @@ DEFAULT_AUTO_TRIGGER_PROMPT = (
     "- Solo Manager 必须使用 {{manager_username}} 对应的有效登录态；当前登录态不是 {{manager_username}} 时立即停止。\n"
     "- Claude Code Key 从钥匙串 `benzhi-claude-code-gaobo-pi-a453493f` 读取，通过 `SOLOSB_CLAUDE_KEY` 注入；"
     "禁止把明文 Key 写入任务目录、状态文件、轨迹或日志。\n"
-    "- 容器名额不写死：由调度监控台动态管理（`~/.codex/sologsb-0917/container-limit.json`，页面修改后随时变化），"
+    "- 容器名额不写死：由调度监控台动态管理（`~/.codex/sologsb-0917/container-limit.json`，弹性扩缩容时随时变化），"
     "技能的容器限流器每次启动容器前自动读取并排队。不要自行设定、记录或核对容器上限；上限变化（包括高于以往的数值）属正常，"
-    "不得据此判定超限或停止任务。\n\n"
+    "不得据此判定超限或停止任务。当前调度模式：{{schedule_mode}}。\n\n"
     "项目接入：\n"
     "- 已选定项目：`{{selected_project}}`。\n"
     "- 非空时必须使用其中的 projectCode 或 projectId 接入，不得静默换题；无法按要求接入时立即停止。\n"
@@ -169,10 +177,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cooldownSeconds": 0,
         "startupTimeoutSeconds": DEFAULT_STARTUP_TIMEOUT_SECONDS,
         "terminalStabilitySeconds": 6,
-        "leaseGraceSeconds": DEFAULT_LEASE_GRACE_SECONDS,
+        "waitTimeoutSeconds": DEFAULT_QUEUE_WAIT_TIMEOUT_SECONDS,
         "maxContainers": DEFAULT_MAX_CANDIDATE_CONTAINERS,
         "candidatesPerTask": 2,
         "anthropicBaseUrl": "https://llm2.jzxhnh.com",
+        "scheduleMode": SCHEDULE_MODE_CONTAINERS,
         "reconcileSeconds": DEFAULT_RECONCILE_SECONDS,
         "startupGraceSeconds": DEFAULT_STARTUP_GRACE_SECONDS,
         "excludedProjectCodes": [],
@@ -195,14 +204,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "failThreshold": 2,
             "timeoutSeconds": 30,
         },
-        # Hold launches while Docker takes too long to start a bare container
-        # (api/docker_probe.py).
-        "dockerProbe": {
-            "enabled": True,
-            "slowSeconds": 60,
-            "intervalSeconds": 300,
-            "unhealthyIntervalSeconds": 60,
-        },
         # Uses per project counted from the QC platform's submissions; at the
         # limit a project is no longer offered or queued (api/qc_usage.py).
         "projectUsage": {
@@ -213,6 +214,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "maxAttempts": 3,
         "retryBackoffSeconds": DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS,
+        "stalledTaskRetrySeconds": DEFAULT_STALLED_TASK_RETRY_SECONDS,
+        "stalledTaskRetryLimit": DEFAULT_STALLED_TASK_RETRY_LIMIT,
         "autoRefill": {
             "enabled": False,
             "intervalSeconds": 60,
@@ -234,7 +237,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "guard": {
             "mode": "observe",
             "candidatePhaseHours": 6,
-            "postPhaseHours": 4,
+            "noProgressMinutes": 60,
             "leakedProcessMinutes": 60,
         },
         # Disk launch gate and cleanup of finished tasks (api/housekeeping.py).
@@ -847,6 +850,7 @@ def render_auto_trigger_prompt(
     max_tasks: int = 2,
     max_containers: int = 4,
     candidates_per_task: int = 2,
+    schedule_mode: str = SCHEDULE_MODE_CONTAINERS,
     manager_username: str = "admin",
 ) -> str:
     """Render the platform task prompt with the selected project snapshot."""
@@ -854,6 +858,7 @@ def render_auto_trigger_prompt(
     code = str(project.get("code") or "").strip()
     name = str(project.get("name") or "").strip()
     selected = " · ".join(part for part in (code, name) if part) or "未指定（由执行器从 Solo Manager 选择）"
+    mode_label = "容器优先（保持运行中的候选容器数等于设定值）" if schedule_mode == SCHEDULE_MODE_CONTAINERS else "任务数量优先（保持并行任务数等于设定值）"
     replacements = {
         "{{selected_project}}": selected,
         "{{project_code}}": code,
@@ -864,8 +869,7 @@ def render_auto_trigger_prompt(
         "{{max_tasks}}": str(max(1, int(max_tasks))),
         "{{max_containers}}": str(max(1, int(max_containers))),
         "{{candidates_per_task}}": str(max(1, int(candidates_per_task))),
-        # Templates saved before the single task cap still carry this marker.
-        "{{schedule_mode}}": "按并行任务数上限启动，容器由技能先来先得排队",
+        "{{schedule_mode}}": mode_label,
         "{{manager_username}}": str(manager_username or "").strip() or "admin",
     }
     rendered = str(template or DEFAULT_AUTO_TRIGGER_PROMPT)

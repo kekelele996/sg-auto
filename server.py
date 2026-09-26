@@ -618,7 +618,7 @@ def main() -> int:
     if service.queue.active_roots() != [str(item) for item in config.get("roots") or []]:
         print(f"已配置目录: {', '.join(str(item) for item in config.get('roots') or [])}")
     print(f"技能 CLI: {config.get('skillScript')}")
-    print(f"并行任务上限: {(config.get('automation') or {}).get('capacity')}")
+    print(f"调度模式: {(config.get('automation') or {}).get('scheduleMode')}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

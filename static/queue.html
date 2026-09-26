@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>任务队列 · sologsb 调度台</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("sologsb-theme-v3")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){}</script>
-  <link rel="stylesheet" href="/static/app.css?v=0.6.0">
+  <link rel="stylesheet" href="/static/app.css?v=1.0.0">
   <style>
     /* ---- status strip: one glance answers "is it running, how full, what needs me" */
     .qstrip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
@@ -135,7 +135,7 @@
       <select class="input" id="folderSelect"></select>
       <div class="rail-path" id="folderPath"></div>
       <span class="rail-label">调度模式</span>
-      <span class="mode-toggle" id="modeBadge" data-mode="containers"><span class="dot"></span>调度上限</span>
+      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
     </div>
     <div class="rail-foot">
       <div class="rail-foot-row">
@@ -251,7 +251,6 @@
                   <span class="auto-sub" id="priorityState"></span>
                 </div>
               </div>
-
               <div class="auto-row" id="usageRow">
                 <label class="switch" title="按质检平台上的提交记录统计每个项目用了几次，达到上限的项目不再入队">
                   <input type="checkbox" id="usageToggle" role="switch"><span class="track"></span>
@@ -309,12 +308,21 @@
           <details class="panel">
             <summary class="panel-head"><h3>调度上限</h3><span id="modeMeta"></span></summary>
             <div class="panel-body grid grid-2">
-              <div class="field"><label for="maxTasksInput">最大任务数</label><input class="input" id="maxTasksInput" type="number" min="1" max="20">
-                <span class="hint">同时运行的任务数，不分候选赛和评审/录屏阶段。</span></div>
+              <div class="field" style="grid-column:1/-1">
+                <label for="modeSelect">模式</label>
+                <select class="input" id="modeSelect">
+                  <option value="containers">容器优先 · 保持运行中的候选容器数等于上限</option>
+                  <option value="tasks">任务数量优先 · 保持并行任务数等于上限</option>
+                </select>
+              </div>
               <div class="field"><label for="maxContainersInput">最大容器数</label><input class="input" id="maxContainersInput" type="number" min="1" max="8">
-                <span class="hint">写给技能，候选按先来先得排队；硬顶 8。</span></div>
+                <span class="hint">与技能共用，硬顶 8；开弹性时为保底值。</span></div>
+              <div class="field"><label for="elasticCeilingInput">弹性上限</label><input class="input" id="elasticCeilingInput" type="number" min="1" max="8">
+                <span class="hint"><label><input type="checkbox" id="elasticToggle"> 弹性扩容</label>：容器满且 30 分钟无 429 时每 10 分钟 +1，候选收到 429 超限立即 −1，不低于保底。</span></div>
               <div class="field"><label for="candidatesInput">单任务候选数</label><input class="input" id="candidatesInput" type="number" min="2" max="8">
                 <span class="hint">2–8。</span></div>
+              <div class="field"><label for="maxTasksInput">最大任务数</label><input class="input" id="maxTasksInput" type="number" min="1" max="20">
+                <span class="hint">仅任务数量优先生效。</span></div>
               <div class="field"><label for="cooldownInput">启动间隔（秒）</label><input class="input" id="cooldownInput" type="number" min="0" max="86400">
                 <span class="hint">最低 20 秒。</span></div>
             </div>
@@ -336,8 +344,8 @@
               <div class="grid grid-2" style="gap:10px">
                 <div class="field"><label for="guardCandidateInput">候选阶段上限（小时）</label>
                   <input class="input" id="guardCandidateInput" type="number" min="1" max="48" step="0.5"></div>
-                <div class="field"><label for="guardPostInput">评审/录屏阶段上限（小时）</label>
-                  <input class="input" id="guardPostInput" type="number" min="1" max="48" step="0.5"></div>
+                <div class="field"><label for="guardQuietInput">无进展上限（分钟）</label>
+                  <input class="input" id="guardQuietInput" type="number" min="15" max="1440"></div>
                 <div class="field" style="grid-column:1/-1"><label for="guardLeakInput">任务结束后残留进程（分钟）</label>
                   <input class="input" id="guardLeakInput" type="number" min="10" max="1440">
                   <span class="hint">已结束且无人持有的任务目录下仍在跑的进程；终端 shell 与 queue_worker 不动。</span></div>
@@ -359,7 +367,7 @@
             <summary class="panel-head"><h3>Prompt 模板</h3><span id="templateCount"></span></summary>
             <div class="panel-body grid" style="gap:10px">
               <textarea id="promptTemplate" spellcheck="false"></textarea>
-              <span class="hint">可用变量：{{manager_username}} {{selected_project}} {{task_type}} {{difficulty}} {{max_containers}} {{max_tasks}} {{candidates_per_task}} {{base_url}}</span>
+              <span class="hint">可用变量：{{manager_username}} {{selected_project}} {{task_type}} {{difficulty}} {{max_containers}} {{max_tasks}} {{candidates_per_task}} {{schedule_mode}} {{base_url}}</span>
               <div class="row-inline">
                 <button class="btn primary" id="saveTemplateBtn" type="button">保存模板</button>
                 <span class="hint">加入队列前会自动保存未保存的修改。</span>
@@ -372,28 +380,22 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=0.6.0"></script>
+<script src="/static/app.js?v=1.0.0"></script>
 <script>
   const { $, $$, esc, debounce, fetchJson, postJson, fmtClock, fmtTime, fmtDuration, toast, TASK_STATE_LABELS,
           initTheme, renderRail, connectStream, renderKeyed, setText, setHtml, setAttr } = window.SoloApp;
 
   // ``phase`` is computed by the server from the item, its state.json and
   // docker ps; it is what the operator cares about (see QueueManager._annotate_phase).
-  // Queue status is pending → running → done | failed; the phase of a running
-  // task (starting / candidates / post / qc) is read from its state.json.
-  const PHASE_LABELS = { queued: "排队中", waiting_slot: "等任务名额", retrying: "等待重试", starting: "启动中",
-    candidates: "候选赛", post: "评审/录屏", qc: "等质检", done: "已完成", failed: "失败" };
+  const PHASE_LABELS = { queued: "排队中", waiting_slot: "等容器名额", retrying: "等待重试", starting: "启动中",
+    executing: "执行中", attention: "需处理", done: "已完成", failed: "失败", skipped: "已跳过" };
   const PHASE_TONES = { queued: "idle", waiting_slot: "idle", retrying: "warn", starting: "run",
-    candidates: "run", post: "run", qc: "run", done: "ok", failed: "bad" };
-  const WAITING_PHASES = new Set(["queued", "waiting_slot", "retrying"]);
-  const EXECUTING_PHASES = new Set(["starting", "candidates", "post", "qc"]);
-  const FINISHED_PHASES = new Set(["done", "failed"]);
-  // Needs a person: flagged by a guard policy, or failed while still holding a slot.
-  const needsAttention = (item) => (Boolean((item.guardFlag || {}).policy) && !FINISHED_PHASES.has(item.phase))
-    || (item.status === "failed" && item.capacityHeld);
+    executing: "run", attention: "warn", done: "ok", failed: "bad", skipped: "idle" };
+  const WAITING_PHASES = new Set(["queued", "waiting_slot", "retrying", "starting"]);
+  const FINISHED_PHASES = new Set(["done", "failed", "skipped"]);
   const GROUPS = [
-    { key: "attention", label: "需处理", test: needsAttention },
-    { key: "executing", label: "执行中", test: (item) => EXECUTING_PHASES.has(item.phase) },
+    { key: "attention", label: "需处理", test: (item) => item.phase === "attention" },
+    { key: "executing", label: "执行中", test: (item) => item.phase === "executing" },
     { key: "waiting", label: "等待启动（按启动顺序）", test: (item) => WAITING_PHASES.has(item.phase) },
     { key: "finished", label: "已结束", test: (item) => FINISHED_PHASES.has(item.phase) },
   ];
@@ -407,12 +409,6 @@
   const stateLabel = (value) => TASK_STATE_LABELS[value] || value || "";
   const queueOf = () => (state.snapshot || {}).queue || {};
 
-  // " · 本阶段 1h 20m" from the server's phaseSince.
-  function sinceText(item) {
-    const at = Date.parse(item.phaseSince || "");
-    return Number.isFinite(at) ? ` · 本阶段 ${fmtDuration((Date.now() - at) / 1000)}` : "";
-  }
-
   // One line saying what the item is doing right now, from facts the server sends.
   function phaseDetail(item) {
     const containers = item.containers || {};
@@ -422,23 +418,23 @@
       case "queued":
         return item.containerWait || "排队中，轮到后自动启动";
       case "waiting_slot":
-        return item.containerWait || "并行任务已满，有空位自动启动";
+        if (item.status === "pending") return item.containerWait || "容器名额已满，有空位自动启动";
+        return `候选 ${running}/${wanted} 已有容器，其余等待名额`;
       case "retrying": {
         const at = Date.parse(item.nextAttemptAt || "");
         return `${Number.isFinite(at) ? `${fmtClock(item.nextAttemptAt)} 后重试` : "等待自动重试"}${item.lastError ? ` · ${item.lastError}` : ""}`;
       }
       case "starting":
-        if (!item.jobPid && !item.triggeredAt) return "正在启动执行器";
-        if (!item.triggeredAt) return "执行器已启动，正在创建桌面任务";
-        return "桌面任务已创建，等待接入源码";
-      case "candidates": {
-        const boxes = wanted ? `候选 ${running}/${wanted} 已有容器${running < wanted ? "，其余在技能内排队" : ""}` : "准备候选";
-        return `${boxes} · ${stateLabel(item.stateStatus)}${sinceText(item)}`;
+        if (item.status === "launching") return "正在启动执行器";
+        if (item.status === "running") return "执行器已启动，正在创建桌面任务";
+        if (!item.stateStatus) return "桌面任务已创建，等待接入源码";
+        return `${stateLabel(item.stateStatus)} · 等待候选启动`;
+      case "executing": {
+        const since = item.triggeredAt ? ` · 已运行 ${fmtDuration((Date.now() - Date.parse(item.triggeredAt)) / 1000)}` : "";
+        return `${running ? `${running} 个候选运行中` : "候选阶段结束"} · ${stateLabel(item.stateStatus)}${since}`;
       }
-      case "post":
-        return `${stateLabel(item.stateStatus)}${sinceText(item)}`;
-      case "qc":
-        return `已提交，等待质检结果${sinceText(item)}`;
+      case "attention":
+        return item.error || item.notice || "需人工确认桌面任务是否已停止";
       case "failed":
         return item.error || item.lastError || "失败";
       case "done":
@@ -525,13 +521,13 @@
 
   /* ------------------------------------------------------------------ rows */
   function rowTools(item, phase) {
-    const active = item.status === "running" || item.capacityHeld;
+    const active = ["launching", "running", "triggered", "orphaned"].includes(item.status) || item.capacityHeld;
     const main = [];
     const more = [];
-    if (item.capacityHeld && item.status === "failed") {
+    if (item.status === "orphaned" || (item.capacityHeld && ["failed", "skipped"].includes(item.status))) {
       main.push(`<button class="btn sm" data-q="release" data-id="${esc(item.id)}">释放名额</button>`);
     }
-    if (!item.capacityHeld && item.status === "failed") {
+    if (!item.capacityHeld && ["failed", "skipped"].includes(item.status)) {
       main.push(`<button class="btn sm" data-q="retry" data-id="${esc(item.id)}">重试</button>`);
     }
     if (item.monitorTaskId && !FINISHED_PHASES.has(phase)) {
@@ -596,6 +592,10 @@
     let notice = "";
     if (flagged) {
       notice = `兜底策略：${flag.label}，${flag.reason}${(queueOf().guard || {}).mode === "enforce" ? "" : "（仅观察，未终止）"}`;
+    } else if (["executing", "waiting_slot", "starting"].includes(phase) && item.noticeKind === "stalled") {
+      notice = item.notice || "";
+    } else if (phase === "skipped") {
+      notice = item.notice || item.error || "";
     }
     changed = setText(f("notice"), notice) || changed;
     if (f("notice").hidden !== !notice) f("notice").hidden = !notice;
@@ -665,7 +665,7 @@
 
     const phases = (queue.counts || {}).phases || {};
     setText($("#queueMeta"), state.filter === "finished"
-      ? `${(queue.counts || {}).done || 0} 完成 · ${(queue.counts || {}).failed || 0} 失败`
+      ? `${(queue.counts || {}).done || 0} 完成 · ${(queue.counts || {}).failed || 0} 失败 · ${(queue.counts || {}).skipped || 0} 跳过`
       : [phases.waiting_slot ? `${phases.waiting_slot} 等名额` : "", phases.retrying ? `${phases.retrying} 待重试` : ""].filter(Boolean).join(" · "));
 
     const paused = Boolean(queue.paused);
@@ -752,7 +752,7 @@
     setText($("#guardModeHint"), GUARD_MODE_HINTS[mode] || "");
     const set = (id, value) => { const node = $(id); if (node && document.activeElement !== node && value != null) node.value = String(value); };
     set("#guardCandidateInput", guard.candidatePhaseHours);
-    set("#guardPostInput", guard.postPhaseHours);
+    set("#guardQuietInput", guard.noProgressMinutes);
     set("#guardLeakInput", guard.leakedProcessMinutes);
     const flags = guard.flags || [];
     const leaks = guard.leaks || [];
@@ -797,7 +797,7 @@
     try {
       await act("set-guard", {
         candidatePhaseHours: Number($("#guardCandidateInput").value),
-        postPhaseHours: Number($("#guardPostInput").value),
+        noProgressMinutes: Number($("#guardQuietInput").value),
         leakedProcessMinutes: Number($("#guardLeakInput").value),
       });
       toast("兜底阈值已应用，下一轮检查生效");
@@ -1079,13 +1079,20 @@
     const skill = queue.skillLimit || {};
     setText($("#limitsHint"), skill.inSync ? `技能已同步 · 上限 ${skill.maxContainers}` : "技能未同步，应用一次即可写入");
     setAttr($("#limitsHint"), "title", skill.path || "container-limit.json");
-    setText($("#modeMeta"), `任务 ${queue.maxTasks} · 容器 ${queue.maxContainers} · 候选 ${queue.candidatesPerTask}`);
+    const elastic = queue.elastic || {};
+    const pinned = elastic.pinnedByPrompt
+      ? ` · ${elastic.pinnedTasks} 个任务的提示词写死了上限，暂不超过 ${elastic.pinnedByPrompt}` : "";
+    setText($("#modeMeta"), queue.scheduleMode === "tasks"
+      ? `任务优先 · 并发 ${queue.maxTasks} · 候选 ${queue.candidatesPerTask}`
+      : elastic.enabled
+        ? `容器优先 · 弹性 ${elastic.current}（${elastic.floor}–${elastic.ceiling}）个 · 候选 ${queue.candidatesPerTask}${elastic.recentRateLimits ? ` · 近 5 分钟 429 ×${elastic.recentRateLimits}（等待 ${elastic.stallPercentNow}%）` : ""}${elastic.learnedForHour ? ` · 本时段学到 ${elastic.learnedForHour}` : ""}${pinned}`
+        : `容器优先 · ${queue.maxContainers} 个 · 候选 ${queue.candidatesPerTask}${pinned}`);
     setText($("#autoMeta"), queue.paused ? "队列暂停中" : "");
   }
 
   /* --------------------------------------------------------------- projects */
   // Same statuses the server refuses to enqueue twice (add_platform).
-  const LIVE_QUEUE_STATUSES = new Set(["pending", "running"]);
+  const LIVE_QUEUE_STATUSES = new Set(["pending", "launching", "running", "triggered", "orphaned"]);
 
   // The one filter behind both the list and 随机选择: pool scope, not already
   // live in the queue, not disabled, matching the search box.
@@ -1186,8 +1193,13 @@
     set("#maxContainersInput", queue.maxContainers);
     set("#candidatesInput", queue.candidatesPerTask);
     set("#cooldownInput", queue.cooldownSeconds);
+    set("#elasticCeilingInput", (queue.elastic || {}).ceiling);
+    const toggle = $("#elasticToggle");
+    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean((queue.elastic || {}).enabled);
     const weights = (queue.autoRefill || {}).taskTypeWeights || {};
     set("#weightInput", weights["feature迭代"] ?? 80);
+    const mode = $("#modeSelect");
+    if (mode && document.activeElement !== mode) mode.value = queue.scheduleMode || "containers";
     const pool = $("#poolToggle");
     if (document.activeElement !== pool) pool.checked = Boolean(queue.mergeProjectPool);
     const template = $("#promptTemplate");
@@ -1208,13 +1220,13 @@
     const previous = queueOf();
     const fresh = data.automation || {};
     const counts = { ...(previous.counts || {}) };
-    for (const key of ["pending", "running", "done", "failed", "quotaClaimed", "quotaRefunded"]) {
+    for (const key of ["pending", "running", "done", "failed", "skipped", "quotaClaimed", "quotaRefunded"]) {
       if ((fresh.counts || {})[key] !== undefined) counts[key] = fresh.counts[key];
     }
     state.snapshot = { ...state.snapshot, queue: { ...previous, ...fresh, counts } };
     // A saved limit shows at once instead of on the next push.
-    if (fresh.maxContainers && state.snapshot.containers) {
-      state.snapshot.containers = { ...state.snapshot.containers, hardLimit: fresh.maxContainers };
+    if (fresh.effectiveMaxContainers && state.snapshot.containers) {
+      state.snapshot.containers = { ...state.snapshot.containers, hardLimit: fresh.effectiveMaxContainers };
     }
     renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
     renderQueue();
@@ -1324,6 +1336,18 @@
     catch (error) { toast(`清理失败：${error.message}`, true); }
   });
 
+  async function setMode(mode) {
+    try {
+      await act("set-schedule-mode", { mode });
+      toast(`调度模式已切换为 ${mode === "containers" ? "容器优先" : "任务数量优先"}`);
+    } catch (error) { toast(`切换失败：${error.message}`, true); }
+  }
+  $("#modeSelect").addEventListener("change", (event) => setMode(event.target.value));
+  $("#modeBadge").addEventListener("click", async () => {
+    const current = queueOf().scheduleMode || "containers";
+    await setMode(current === "containers" ? "tasks" : "containers");
+  });
+
   $("#saveLimitsBtn").addEventListener("click", async () => {
     try {
       await act("set-limits", {
@@ -1331,6 +1355,10 @@
         maxContainers: Number($("#maxContainersInput").value),
         candidatesPerTask: Number($("#candidatesInput").value),
         cooldownSeconds: Number($("#cooldownInput").value),
+        elasticContainers: {
+          enabled: $("#elasticToggle").checked,
+          ceiling: Number($("#elasticCeilingInput").value),
+        },
       });
       toast("上限参数已应用");
     } catch (error) { toast(`应用失败：${error.message}`, true); }
