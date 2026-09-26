@@ -36,7 +36,7 @@
     "startupTimeoutSeconds": 300,
     "terminalStabilitySeconds": 6,
     "waitTimeoutSeconds": 50400,
-    "maxContainers": 5,
+    "maxContainers": 6,
     "candidatesPerTask": 2,
     "anthropicBaseUrl": "https://llm2.jzxhnh.com",
     "scheduleMode": "containers",
