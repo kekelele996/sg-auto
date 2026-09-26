@@ -354,6 +354,40 @@ class ManualEnqueueGateTests(unittest.TestCase):
                 self._add("gb-14-1")
 
 
+class SetLimitsTests(unittest.TestCase):
+    """A limit saved on the page applies at once."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        (self.root / "tasks").mkdir(parents=True, exist_ok=True)
+        config = make_config(self.root)
+        config["_configPath"] = str(self.root / "config.json")
+        config["automation"].update({"maxContainers": 5, "elasticContainers": {"enabled": True, "ceiling": 8}})
+        self.service = SchedulerService(config)
+        self.addCleanup(self.service.stop)
+
+    def _save(self, **payload):
+        form = {"maxTasks": 3, "maxContainers": 5, "candidatesPerTask": 2, "cooldownSeconds": 210,
+                "elasticContainers": {"enabled": True, "ceiling": 8}}
+        return self.service.automation_action("set-limits", {**form, **payload})
+
+    def test_saving_waives_old_prompt_caps_and_starts_at_the_saved_floor(self):
+        queue = self.service.queue
+        queue._prompt_pin = {"limit": 4, "tasks": 1, "items": ["platform-old"]}
+        queue._elastic["limit"] = 7
+        snapshot = self._save(maxContainers=6)
+        self.assertEqual(snapshot["effectiveMaxContainers"], 6)
+        self.assertEqual(json.loads(queue.slots.limit_path.read_text(encoding="utf-8"))["maxContainers"], 6)
+
+    def test_an_unchanged_floor_keeps_the_elastic_limit(self):
+        queue = self.service.queue
+        queue._elastic["limit"] = 7
+        snapshot = self._save(cooldownSeconds=120)
+        self.assertEqual(snapshot["effectiveMaxContainers"], 7)
+
+
 class BackgroundLoopTests(unittest.TestCase):
     """The launch tick must not queue behind the slow Manager refill.
 

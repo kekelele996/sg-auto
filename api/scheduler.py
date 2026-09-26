@@ -1103,6 +1103,8 @@ class QueueManager:
         self.elastic_path = self.state_path.parent / "elastic.json"
         loaded_elastic = read_json(self.elastic_path, {})
         self._prompt_pin: dict[str, Any] = {}
+        # Jobs whose prompt cap the user overrode by saving a limit on the page.
+        self._prompt_pin_waived: set[str] = set()
         self._elastic: dict[str, Any] = loaded_elastic if isinstance(loaded_elastic, dict) else {}
         self._rl_offsets: dict[str, int] = {}
         # (seen at, attempt, retry wait seconds) per 429 in the window.
@@ -1370,8 +1372,12 @@ class QueueManager:
         stays at or below the lowest N.
         """
         pins: list[tuple[int, str]] = []
-        for job in self.jobs.running():
-            if job.get("source") != "platform" or self._job_candidate_phase_finished(job):
+        running = self.jobs.running()
+        self._prompt_pin_waived &= {str(job.get("key") or "") for job in running}
+        for job in running:
+            if job.get("source") != "platform" or str(job.get("key") or "") in self._prompt_pin_waived:
+                continue
+            if self._job_candidate_race_over(job):
                 continue
             prompt_path = Path(str(job.get("triggerPromptPath") or ""))
             prompt = self.file_cache.text(prompt_path) if prompt_path.is_file() else ""
@@ -1391,6 +1397,40 @@ class QueueManager:
                 self._emit("info", "config.limit_pin_released",
                            detail=f"写死容器上限的任务都已跑完候选赛，恢复按配置 / 弹性上限（此前暂按 {previous}）")
             self.sync_skill_limits()
+
+    @staticmethod
+    def _job_candidate_race_over(job: dict[str, Any]) -> bool:
+        """Whether the race is decided for good, so its prompt cap no longer matters.
+
+        Stricter than ``_job_candidate_phase_finished``: between two attempts
+        no candidate is ``running`` and the skill writes ``candidates_ready``
+        before the next attempt starts.  Reading that as "past the race"
+        released the pin and set it again 26 s later (ld-430 at 16:27).
+        """
+        task_root = JobManager._platform_job_task_root(job)
+        if task_root is None:
+            return False
+        state = read_json(task_root / "monitor" / "state.json", {})
+        if not isinstance(state, dict):
+            return False
+        if state.get("candidateRaceFinishedAt") or state.get("candidateMapping"):
+            return True
+        return str(state.get("status") or "") in TERMINAL_TASK_STATUSES
+
+    def waive_prompt_pin(self) -> list[str]:
+        """The user saved a limit: it applies now, whatever old prompts say."""
+        with self._lock:
+            items = list(self._prompt_pin.get("items") or [])
+            pinned = self._prompt_pin.get("limit") or 0
+            for job in self.jobs.running():
+                if job.get("source") == "platform":
+                    self._prompt_pin_waived.add(str(job.get("key") or ""))
+            self._prompt_pin = {}
+        if pinned:
+            self._emit("warning", "config.limit_pin_waived",
+                       detail=f"页面保存了容器上限，不再按旧提示词写死的 {pinned} 限制"
+                              f"（{len(items)} 个任务的提示词仍写着该值）")
+        return items
 
     def _rate_limit_pressure(self, now: float, limit: int) -> tuple[float, int, int]:
         """(share of container time spent in 429 retry waits, worst attempt, 429 count) in the window."""
@@ -1451,13 +1491,21 @@ class QueueManager:
             "pinnedTasks": int(self._prompt_pin.get("tasks") or 0),
         }
 
-    def reset_elastic(self) -> None:
-        """Start again (switch toggled or floor changed) from what this hour learned, else the floor."""
+    def reset_elastic(self, *, from_floor: bool = False) -> None:
+        """Start again from what this hour learned, else the floor.
+
+        ``from_floor``: the user just saved the floor, so start exactly there;
+        jumping to a learned value read as "the saved number has no effect".
+        """
         with self._lock:
             now = time.time()
             keep = ("last429At", "lastPressureAt", "learned")
             self._elastic = {k: v for k, v in self._elastic.items() if k in keep}
-            learned = self._learned_limit(now)
+            learned = 0 if from_floor else self._learned_limit(now)
+            if from_floor:
+                # Held for one step-up interval before probing above it.
+                self._elastic.update({"hour": time.localtime(now).tm_hour, "lastChangeAt": now,
+                                      "lastReason": "页面保存的保底值"})
             if learned:
                 self._elastic.update({"limit": learned, "hour": time.localtime(now).tm_hour,
                                       "lastReason": f"从本时段学到的 {learned} 个容器开始"})

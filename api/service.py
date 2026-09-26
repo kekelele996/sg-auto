@@ -953,6 +953,9 @@ class SchedulerService:
         """
         automation = self.config.setdefault("automation", {})
         changes: list[str] = []
+        # The form posts every field; only a floor that really changed resets
+        # the elastic limit (saving the cooldown must not drop it to the floor).
+        floor_changed = False
         if "maxTasks" in payload:
             value = int(payload.get("maxTasks") or 0)
             if value < 1 or value > 20:
@@ -963,6 +966,7 @@ class SchedulerService:
             value = int(payload.get("maxContainers") or 0)
             if value < 1 or value > SKILL_ABSOLUTE_MAX_CONTAINERS:
                 raise MonitorError(f"最大容器数必须在 1 到 {SKILL_ABSOLUTE_MAX_CONTAINERS} 之间（技能侧硬顶）")
+            floor_changed = value != automation.get("maxContainers")
             automation["maxContainers"] = value
             changes.append(f"maxContainers={value}")
         if "maxActiveTasks" in payload:
@@ -1007,8 +1011,11 @@ class SchedulerService:
             raise MonitorError("没有需要更新的上限参数")
         prune_legacy_automation(automation)
         self._persist_config()
-        if reset_elastic or any(change.startswith("maxContainers=") for change in changes):
-            self.queue.reset_elastic()
+        if reset_elastic or floor_changed:
+            self.queue.reset_elastic(from_floor=floor_changed)
+        if "maxContainers" in payload or isinstance(payload.get("elasticContainers"), dict):
+            # A saved limit applies at once, not after old tasks finish their race.
+            self.queue.waive_prompt_pin()
         self.queue.sync_skill_limits()
         self.log.emit("config.limits", detail="，".join(changes))
         return self.queue.fast_snapshot()

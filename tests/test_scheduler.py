@@ -1499,11 +1499,12 @@ class ElasticLimitTests(SchedulerTestCase):
         self.assertEqual(snapshot["maxContainers"], 5)
         self.assertEqual(snapshot["effectiveMaxContainers"], 6)
 
-    def _old_prompt_job(self, queue, cap, *, state="candidates_running"):
+    def _old_prompt_job(self, queue, cap, *, state="candidates_running", mapping=None):
         """A live task whose prompt was rendered with the old fixed cap."""
         root_dir = self.root / "tasks" / f"old-{cap}-{state}"
         (root_dir / "monitor").mkdir(parents=True, exist_ok=True)
-        (root_dir / "monitor" / "state.json").write_text(json.dumps({"status": state}), encoding="utf-8")
+        (root_dir / "monitor" / "state.json").write_text(
+            json.dumps({"status": state, "candidateMapping": mapping or {}}), encoding="utf-8")
         prompt = self.root / f"old-{cap}-{state}.prompt.txt"
         prompt.write_text(f"- 单 Key 全局硬上限为 {cap} 个候选容器，按“3 个任务”共享名额。\n", encoding="utf-8")
         job = {"key": f"old-{cap}-{state}", "source": "platform", "status": "running",
@@ -1531,10 +1532,63 @@ class ElasticLimitTests(SchedulerTestCase):
         self.assertNotIn("elastic.up", self.events)
         self.assertEqual(queue.elastic_status()["pinnedByPrompt"], 6)
 
+    def test_the_gap_between_two_attempts_does_not_lift_the_pin(self):
+        """ld-430: no candidate running between attempts read as "race over"; the pin flapped."""
+        queue = self._queue(9, enabled=False)
+        queue.config["automation"]["maxContainers"] = 6
+        job = self._old_prompt_job(queue, 5)
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        state_path = Path(job["taskRoot"]) / "monitor" / "state.json"
+        state_path.write_text(json.dumps({"status": "candidates_ready", "candidateMapping": {}}), encoding="utf-8")
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        self.assertNotIn("config.limit_pin_released", self.events)
+        state_path.write_text(json.dumps({"status": "semantic_review_required",
+                                          "candidateMapping": {"A": "candidate-2", "B": "candidate-1"}}),
+                              encoding="utf-8")
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        self.assertIn("config.limit_pin_released", self.events)
+
+    def test_saving_a_limit_on_the_page_overrides_old_prompt_caps(self):
+        queue = self._queue(9, enabled=False)
+        queue.config["automation"]["maxContainers"] = 6
+        self._old_prompt_job(queue, 5)
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 5)
+        queue.waive_prompt_pin()
+        queue.sync_skill_limits()
+        self.assertEqual(queue._max_containers_limit(), 6)
+        self.assertEqual(self._skill_limit(queue), 6)
+        self.assertIn("config.limit_pin_waived", self.events)
+        # The waived task does not pin again on the next tick …
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        # … but a task started later with an old prompt still would.
+        self._old_prompt_job(queue, 4)
+        self._refresh_pin(queue)
+        self.assertEqual(queue._max_containers_limit(), 4)
+
+    def test_saving_the_floor_starts_there_not_at_the_learned_limit(self):
+        queue = self._queue(9, stableSeconds=600)
+        self._at(queue, 7)
+        queue._elastic["lastChangeAt"] = time.time() - 700
+        self._step(queue)
+        self.assertEqual(queue._learned_limit(time.time()), 7)
+        queue.config["automation"]["maxContainers"] = 6
+        queue.reset_elastic(from_floor=True)
+        self.assertEqual(queue._max_containers_limit(), 6)
+        # The learned value is kept for the next hour/toggle.
+        self.assertEqual(queue._learned_limit(time.time()), 7)
+        self._step(queue)
+        self.assertEqual(queue._max_containers_limit(), 6)
+
     def test_the_pin_also_holds_a_raised_floor_and_lifts_after_the_race(self):
         queue = self._queue(9, enabled=False)
         self._old_prompt_job(queue, 5)
-        self._old_prompt_job(queue, 3, state="candidates_ready")  # past the race: no longer pins
+        # Past the race (A/B mapped): no longer pins.
+        self._old_prompt_job(queue, 3, state="candidates_ready", mapping={"A": "candidate-1", "B": "candidate-2"})
         queue.config["automation"]["maxContainers"] = 7
         self._refresh_pin(queue)
         self.assertEqual(queue._max_containers_limit(), 5)

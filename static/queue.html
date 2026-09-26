@@ -1164,6 +1164,10 @@
       if ((fresh.counts || {})[key] !== undefined) counts[key] = fresh.counts[key];
     }
     state.snapshot = { ...state.snapshot, queue: { ...previous, ...fresh, counts } };
+    // A saved limit shows at once instead of on the next push.
+    if (fresh.effectiveMaxContainers && state.snapshot.containers) {
+      state.snapshot.containers = { ...state.snapshot.containers, hardLimit: fresh.effectiveMaxContainers };
+    }
     renderRail({ ...state.snapshot, connected: state.connected, error: state.error });
     renderQueue();
     renderDisabled();
