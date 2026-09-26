@@ -25,7 +25,6 @@ def make_config(root: Path, **overrides) -> dict:
             "capacity": 2,
             "paused": False,
             "autoRefill": {"enabled": False},
-            "scheduleMode": "containers",
             "maxContainers": 4,
             "candidatesPerTask": 2,
         },

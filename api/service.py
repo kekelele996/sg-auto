@@ -39,6 +39,12 @@ from .common import (
     auto_refill_interval_seconds,
     clamp_int,
     deep_merge,
+    PRIORITY_PREFIX_LIMIT,
+    PRIORITY_PREFIX_MAX_LENGTH,
+    is_priority_project,
+    normalize_priority_prefixes,
+    priority_project_prefixes,
+    priority_projects_settings,
     read_json,
     keychain_read,
     redact_text,
@@ -48,6 +54,7 @@ from .common import (
 from .folders import FolderProvider
 from .guard import GUARD_MODES, TaskGuard, guard_settings
 from .housekeeping import Housekeeper
+from .docker_probe import DockerProbe
 from .llm_guard import LlmGuard
 from .qc_usage import ProjectUsage, project_usage_settings
 from .health import LoopHealth, Watchdog
@@ -310,6 +317,7 @@ class SchedulerService:
         self.llm_guard = LlmGuard(self.config, persist=self._persist_config, emit=self.log.emit)
         self.llm_guard.health = self.health
         self.queue.llm_guard = self.llm_guard
+        self.queue.docker_probe = DockerProbe(self.config, emit=self.log.emit)
         self.llm_guard.on_resumed = self._recover_after_outage
         self.project_usage = ProjectUsage(self.config, emit=self.log.emit)
         self.project_usage.health = self.health
@@ -599,7 +607,6 @@ class SchedulerService:
             "selectedFolderId": str(settings.get("defaultFolderId") or ""),
             "selectedFolderPath": str(settings.get("defaultFolderPath") or ""),
             "disabledProjects": self.disabled_projects(),
-            "scheduleMode": queue_snapshot.get("scheduleMode"),
             "paused": bool(queue_snapshot.get("paused", True)),
             "config": {
                 "pollSeconds": int((self.config.get("monitor") or {}).get("pollSeconds") or 3),
@@ -738,14 +745,6 @@ class SchedulerService:
             self._persist_config()
             self.log.emit("config.capacity", detail=f"并发任务数 → {value}")
             return self.queue.fast_snapshot()
-        if action == "set-schedule-mode":
-            mode = str(payload.get("mode") or "")
-            if mode not in {"tasks", "containers"}:
-                raise MonitorError("调度模式只能是 tasks 或 containers")
-            self.config.setdefault("automation", {})["scheduleMode"] = mode
-            self._persist_config()
-            self.log.emit("config.schedule_mode", detail=f"调度模式 → {mode}")
-            return self.queue.fast_snapshot()
         if action == "set-limits":
             return self._set_limits(payload)
         if action == "set-cooldown":
@@ -831,6 +830,8 @@ class SchedulerService:
             return self.queue.fast_snapshot()
         if action == "set-project-usage":
             return self._set_project_usage(payload)
+        if action == "set-priority-projects":
+            return self._set_priority_projects(payload)
         if action == "refresh-project-usage":
             status = self.project_usage.refresh()
             self.log.emit("project_usage.refresh", level="warning" if status.get("error") else "info",
@@ -887,8 +888,7 @@ class SchedulerService:
                 max_tasks=int(self.config.get("automation", {}).get("capacity") or 2),
                 max_containers=self.queue._max_containers_limit(),
                 candidates_per_task=self.queue._candidates_per_task(),
-                schedule_mode=self.queue._schedule_mode(),
-                manager_username=self._manager_username(),
+                                manager_username=self._manager_username(),
             )
             item = self.queue.add_platform(
                 project,
@@ -948,14 +948,12 @@ class SchedulerService:
 
         ``maxContainers`` is the single container limit: it is also written to
         the skill's ``container-limit.json`` so the executor enforces the same
-        number.  Legacy keys (refill threshold, reserve/startup windows, …) are
+        number.  ``maxTasks`` is the single cap on tasks running at once.
+        Legacy keys (refill threshold, elastic limit, phase caps, …) are
         accepted from old clients and ignored.
         """
         automation = self.config.setdefault("automation", {})
         changes: list[str] = []
-        # The form posts every field; only a floor that really changed resets
-        # the elastic limit (saving the cooldown must not drop it to the floor).
-        floor_changed = False
         if "maxTasks" in payload:
             value = int(payload.get("maxTasks") or 0)
             if value < 1 or value > 20:
@@ -966,35 +964,8 @@ class SchedulerService:
             value = int(payload.get("maxContainers") or 0)
             if value < 1 or value > SKILL_ABSOLUTE_MAX_CONTAINERS:
                 raise MonitorError(f"最大容器数必须在 1 到 {SKILL_ABSOLUTE_MAX_CONTAINERS} 之间（技能侧硬顶）")
-            floor_changed = value != automation.get("maxContainers")
             automation["maxContainers"] = value
             changes.append(f"maxContainers={value}")
-        if "maxActiveTasks" in payload:
-            # Empty/0 goes back to the default derived from maxContainers.
-            value = int(payload.get("maxActiveTasks") or 0)
-            if value < 0 or value > 50:
-                raise MonitorError("容器模式活跃任务上限必须在 1 到 50 之间（0 表示自动）")
-            if value:
-                automation["maxActiveTasks"] = value
-            else:
-                automation.pop("maxActiveTasks", None)
-            changes.append(f"maxActiveTasks={value or 'auto'}")
-        reset_elastic = False
-        if isinstance(payload.get("elasticContainers"), dict):
-            wanted = payload["elasticContainers"]
-            elastic = automation.setdefault("elasticContainers", {})
-            if "enabled" in wanted:
-                enabled = bool(wanted.get("enabled"))
-                if enabled != bool(elastic.get("enabled")):
-                    reset_elastic = True
-                elastic["enabled"] = enabled
-                changes.append(f"elastic={'on' if enabled else 'off'}")
-            if "ceiling" in wanted:
-                value = int(wanted.get("ceiling") or 0)
-                if value < 1 or value > SKILL_ABSOLUTE_MAX_CONTAINERS:
-                    raise MonitorError(f"弹性容器上限必须在 1 到 {SKILL_ABSOLUTE_MAX_CONTAINERS} 之间（技能侧硬顶）")
-                elastic["ceiling"] = value
-                changes.append(f"elasticCeiling={value}")
         if "candidatesPerTask" in payload:
             value = int(payload.get("candidatesPerTask") or 0)
             if value < 2 or value > 8:
@@ -1011,11 +982,6 @@ class SchedulerService:
             raise MonitorError("没有需要更新的上限参数")
         prune_legacy_automation(automation)
         self._persist_config()
-        if reset_elastic or floor_changed:
-            self.queue.reset_elastic(from_floor=floor_changed)
-        if "maxContainers" in payload or isinstance(payload.get("elasticContainers"), dict):
-            # A saved limit applies at once, not after old tasks finish their race.
-            self.queue.waive_prompt_pin()
         self.queue.sync_skill_limits()
         self.log.emit("config.limits", detail="，".join(changes))
         return self.queue.fast_snapshot()
@@ -1038,8 +1004,7 @@ class SchedulerService:
                 max_tasks=int(self.config.get("automation", {}).get("capacity") or 2),
                 max_containers=self.queue._max_containers_limit(),
                 candidates_per_task=self.queue._candidates_per_task(),
-                schedule_mode=self.queue._schedule_mode(),
-                manager_username=self._manager_username(),
+                                manager_username=self._manager_username(),
             )
             if item.get("triggerPrompt") != prompt:
                 item["triggerPrompt"] = prompt
@@ -1072,6 +1037,37 @@ class SchedulerService:
                              f"上限 {settings['limit']}，{scope_text}")
         return self.queue.fast_snapshot()
 
+    def _set_priority_projects(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cfg = self.config.setdefault("automation", {}).setdefault("priorityProjects", {})
+        if "prefixes" in payload:
+            raw = payload.get("prefixes")
+            if not isinstance(raw, (list, str)):
+                raise MonitorError("prefixes 必须是数组或字符串")
+            prefixes = normalize_priority_prefixes(raw)
+            if len(prefixes) > PRIORITY_PREFIX_LIMIT:
+                raise MonitorError(f"优先前缀最多 {PRIORITY_PREFIX_LIMIT} 个")
+            too_long = [prefix for prefix in prefixes if len(prefix) > PRIORITY_PREFIX_MAX_LENGTH]
+            if too_long:
+                raise MonitorError(f"优先前缀不能超过 {PRIORITY_PREFIX_MAX_LENGTH} 个字符")
+            cfg["prefixes"] = prefixes
+            if not prefixes and "enabled" not in payload:
+                cfg["enabled"] = False
+        if "enabled" in payload:
+            cfg["enabled"] = bool(payload.get("enabled"))
+        settings = priority_projects_settings(self.config)
+        if settings["enabled"] and not settings["prefixes"]:
+            raise MonitorError("开启优先项目前请先填写至少一个前缀")
+        with self._queue_refill_lock:
+            self._persist_config()
+            # Queue the new priority projects on the next loop pass instead of
+            # waiting out the refill interval.
+            self._last_queue_refill_at = 0.0
+        self.queue.prioritize_pending()
+        self.log.emit("config.priority_projects",
+                      detail=f"优先项目 → {'开启' if settings['enabled'] else '关闭'}，"
+                             f"前缀：{'、'.join(settings['prefixes']) or '无'}")
+        return self.queue.fast_snapshot()
+
     def _set_auto_refill(self, enabled: bool) -> dict[str, Any]:
         with self._queue_refill_lock:
             self.config.setdefault("automation", {}).setdefault("autoRefill", {})["enabled"] = enabled
@@ -1094,7 +1090,7 @@ class SchedulerService:
                 raise MonitorError("兜底模式只能是 off、observe 或 enforce")
             cfg["mode"] = mode
             changes.append(f"mode={mode}")
-        for key, low, high in (("candidatePhaseHours", 1, 48), ("noProgressMinutes", 15, 1440),
+        for key, low, high in (("candidatePhaseHours", 1, 48), ("postPhaseHours", 1, 48),
                                ("leakedProcessMinutes", 10, 1440)):
             if key not in payload:
                 continue
@@ -1104,7 +1100,7 @@ class SchedulerService:
                 raise MonitorError(f"{key} 必须是数字") from None
             if value < low or value > high:
                 raise MonitorError(f"{key} 必须在 {low} 到 {high} 之间")
-            cfg[key] = value if key == "candidatePhaseHours" else int(value)
+            cfg[key] = int(value) if key == "leakedProcessMinutes" else value
             changes.append(f"{key}={cfg[key]:g}")
         if not changes:
             raise MonitorError("没有需要更新的兜底参数")
@@ -1494,6 +1490,7 @@ class SchedulerService:
             weighted_selection = weight_total > 0
             difficulty = str(cfg.get("difficulty") or (self.config.get("platform") or {}).get("difficulty") or "困难")
             include_project_pool = bool((self.config.get("platform") or {}).get("mergeProjectPool", False))
+            priority_prefixes = priority_project_prefixes(self.config)
             candidates_by_type: dict[str, dict[str, dict[str, Any]]] = {}
             reasons_by_type: dict[str, dict[str, str]] = {}
             errors: list[str] = []
@@ -1562,8 +1559,13 @@ class SchedulerService:
             effective_target = max(0, target - active_count)
             tracked = self.queue.tracked_project_codes()
             added = 0
-            while added < batch_size and pending < effective_target:
-                needed_types = [
+            while added < batch_size:
+                # A full queue still takes priority-prefix projects, so they do
+                # not wait for the queued others to drain first.
+                full = pending >= effective_target
+                if full and not priority_prefixes:
+                    break
+                needed_types = list(task_types) if full else [
                     task_type for task_type in task_types
                     if pending < effective_target or pending_by_type.get(task_type, 0) < target_per_type
                 ]
@@ -1582,6 +1584,7 @@ class SchedulerService:
 
                 needed_types.sort(key=selection_rank)
                 selected: tuple[str, str, dict[str, Any]] | None = None
+                choices_by_type: dict[str, list[tuple[str, dict[str, Any]]]] = {}
                 for task_type in needed_types:
                     choices = [
                         (code, project)
@@ -1590,10 +1593,25 @@ class SchedulerService:
                     ]
                     if randomize:
                         self._refill_rng.shuffle(choices)
-                    if choices:
-                        code, project = choices[0]
-                        selected = (task_type, code, project)
-                        break
+                    choices_by_type[task_type] = choices
+                # Priority-prefix projects win over the task-type balance: they
+                # are used up first, then the rest fill in.
+                if priority_prefixes:
+                    for task_type in needed_types:
+                        hit = next(
+                            (choice for choice in choices_by_type[task_type]
+                             if is_priority_project(choice[0], priority_prefixes)),
+                            None,
+                        )
+                        if hit:
+                            selected = (task_type, hit[0], hit[1])
+                            break
+                if not selected and not full:
+                    for task_type in needed_types:
+                        if choices_by_type[task_type]:
+                            code, project = choices_by_type[task_type][0]
+                            selected = (task_type, code, project)
+                            break
                 if not selected:
                     break
                 task_type, code, project = selected
@@ -1606,8 +1624,7 @@ class SchedulerService:
                     max_tasks=int(self.config.get("automation", {}).get("capacity") or 2),
                     max_containers=self.queue._max_containers_limit(),
                     candidates_per_task=self.queue._candidates_per_task(),
-                    schedule_mode=self.queue._schedule_mode(),
-                    manager_username=self._manager_username(),
+                                        manager_username=self._manager_username(),
                 )
                 try:
                     self.queue.add_platform(

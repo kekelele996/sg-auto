@@ -7,7 +7,7 @@ from pathlib import Path
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from queue_log import LogWriter, RolloutLogFollower, format_rollout_event, redact_log_text  # noqa: E402
+from queue_log import LogWriter, RolloutLogFollower, format_rollout_event, redact_log_text, rollout_turn_open  # noqa: E402
 
 
 class QueueLogTests(unittest.TestCase):
@@ -71,6 +71,25 @@ class QueueLogTests(unittest.TestCase):
                 handle.write(json.dumps(event | {"timestamp": "2026-09-18T01:00:03Z"}, ensure_ascii=False) + "\n")
             self.assertEqual(follower.pump(), 1)
             self.assertEqual(output.read_text(encoding="utf-8").count("第一段"), 2)
+
+    def test_turn_open_follows_the_last_turn_marker(self):
+        def line(kind):
+            return json.dumps({"type": "event_msg", "payload": {"type": kind}}) + "\n"
+
+        with tempfile.TemporaryDirectory() as temp:
+            rollout = Path(temp) / "rollout.jsonl"
+            rollout.write_text(line("task_started") + line("token_count"), encoding="utf-8")
+            self.assertTrue(rollout_turn_open(rollout))
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(line("task_complete"))
+            self.assertFalse(rollout_turn_open(rollout))
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(line("task_started"))
+            self.assertTrue(rollout_turn_open(rollout))
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(line("turn_aborted"))
+            self.assertFalse(rollout_turn_open(rollout))
+            self.assertFalse(rollout_turn_open(Path(temp) / "missing.jsonl"))
 
 
 if __name__ == "__main__":

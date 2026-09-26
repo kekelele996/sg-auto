@@ -26,7 +26,7 @@
       <select class="input" id="folderSelect"></select>
       <div class="rail-path" id="folderPath"></div>
       <span class="rail-label">调度模式</span>
-      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
+      <span class="mode-toggle" id="modeBadge" data-mode="containers"><span class="dot"></span>调度上限</span>
     </div>
     <div class="rail-foot">
       <div class="rail-foot-row">
@@ -177,18 +177,6 @@
   }, 120));
   $("#clearBtn").addEventListener("click", () => { state.entries = []; render(); });
 
-  async function setMode(mode) {
-    try {
-      await postJson("/api/automation", { action: "set-schedule-mode", mode });
-      toast(`调度模式已切换为 ${mode === "containers" ? "容器优先" : "任务数量优先"}`);
-    } catch (error) {
-      toast(`切换失败：${error.message}`, true);
-    }
-  }
-  $("#modeBadge").addEventListener("click", async () => {
-    const current = ((state.snapshot || {}).queue || {}).scheduleMode || "containers";
-    await setMode(current === "containers" ? "tasks" : "containers");
-  });
   $("#folderSelect").addEventListener("change", async (event) => {
     try {
       await postJson("/api/settings", { settings: { defaultFolderId: event.target.value } });

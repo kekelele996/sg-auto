@@ -26,7 +26,7 @@
       <select class="input" id="folderSelect"></select>
       <div class="rail-path" id="folderPath"></div>
       <span class="rail-label">调度模式</span>
-      <button class="mode-toggle" id="modeBadge" type="button" data-mode="containers"><span class="dot"></span>容器优先</button>
+      <span class="mode-toggle" id="modeBadge" data-mode="containers"><span class="dot"></span>调度上限</span>
     </div>
     <div class="rail-foot">
       <div class="rail-foot-row">
@@ -580,18 +580,6 @@
   }
 
   /* ---------------------------------------------------------------- actions */
-  async function switchMode() {
-    const current = (state.data && (state.data.queue || {}).scheduleMode) || "containers";
-    const next = current === "containers" ? "tasks" : "containers";
-    try {
-      await postJson("/api/automation", { action: "set-schedule-mode", mode: next });
-      toast(`调度模式已切换为 ${next === "containers" ? "容器优先" : "任务数量优先"}`);
-      applySnapshot(await fetchJson("/api/snapshot"));
-    } catch (error) {
-      toast(`切换模式失败：${error.message}`, true);
-    }
-  }
-
   async function saveFolder() {
     const id = $("#folderSelect").value;
     try {
@@ -709,7 +697,6 @@
     try { applySnapshot(await fetchJson("/api/snapshot")); }
     catch (error) { toast(`刷新失败：${error.message}`, true); }
   });
-  $("#modeBadge").addEventListener("click", switchMode);
   $("#folderSelect").addEventListener("change", saveFolder);
   $("#closeModalBtn").addEventListener("click", closeTask);
   // The modal is a child of the scrim, so every click inside it bubbles here.

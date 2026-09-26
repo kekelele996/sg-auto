@@ -11,7 +11,7 @@ APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
 from api.common import MonitorError, iso_from_timestamp  # noqa: E402
-from api.guard import TaskGuard, guard_settings, latest_activity  # noqa: E402
+from api.guard import TaskGuard, guard_settings, worker_wait_timeout_seconds  # noqa: E402
 from api.service import SchedulerService  # noqa: E402
 from tests.support import SchedulerTestCase, write_task  # noqa: E402
 from tests.test_scheduler import build_queue, platform_item  # noqa: E402
@@ -50,7 +50,8 @@ class GuardTestCase(SchedulerTestCase):
             clock=lambda: self.now,
         )
 
-    def _task(self, name, *, status="candidates_running", race_age=None, race_done=False, quiet=0.0):
+    def _task(self, name, *, status="candidates_running", race_age=None, race_done=False, quiet=0.0,
+              post_age=None):
         task_root = write_task(self.root, name, status=status, sides={
             "A": {"status": "running", "runPid": 999999}, "B": {"status": "idle"},
         })
@@ -59,7 +60,7 @@ class GuardTestCase(SchedulerTestCase):
         if race_age is not None:
             state["candidateRaceStartedAt"] = iso_from_timestamp(self.now - race_age)
         if race_done:
-            state["candidateRaceFinishedAt"] = iso_from_timestamp(self.now - 60)
+            state["candidateRaceFinishedAt"] = iso_from_timestamp(self.now - (post_age or 60))
         state["candidates"] = {"candidate-1": {"status": "running"}}
         state_path.write_text(json.dumps(state), encoding="utf-8")
         self._age(task_root, quiet)
@@ -73,7 +74,7 @@ class GuardTestCase(SchedulerTestCase):
                 os.utime(Path(current) / name, (stamp, stamp))
 
     def _queue(self, task_root, **overrides):
-        item = platform_item(**{"status": "triggered", "taskRoot": str(task_root), "capacityHeld": True,
+        item = platform_item(**{"status": "running", "taskRoot": str(task_root), "capacityHeld": True,
                                 "quota": {"state": "claimed"}, **overrides})
         return build_queue(self.config, items=[item])
 
@@ -93,7 +94,7 @@ class CandidateTimeoutTests(GuardTestCase):
         guard.run_once()
 
         item = queue._items[0]
-        self.assertEqual(item["status"], "triggered")
+        self.assertEqual(item["status"], "running")
         self.assertEqual(item["guardFlag"]["policy"], "candidate-timeout")
         self.assertEqual(queue.guard_status["flags"][0]["itemId"], item["id"])
         self.assertEqual(self.log.names().count("guard.would_stop"), 1)
@@ -156,7 +157,7 @@ class CandidateTimeoutTests(GuardTestCase):
     def test_race_within_the_limit_is_left_alone(self):
         queue = self._queue(self._task("gb-1-ok", race_age=5 * HOUR))
         self._guard(queue, mode="enforce").run_once()
-        self.assertEqual(queue._items[0]["status"], "triggered")
+        self.assertEqual(queue._items[0]["status"], "running")
         self.assertFalse(queue._items[0].get("guardFlag"))
 
     def test_finished_race_does_not_count(self):
@@ -173,7 +174,7 @@ class CandidateTimeoutTests(GuardTestCase):
         self.config["automation"]["excludedProjectCodes"] = ["gb-1"]
         queue = self._queue(self._task("gb-1-slow", race_age=9 * HOUR))
         self._guard(queue, mode="enforce").run_once()
-        self.assertEqual(queue._items[0]["status"], "triggered")
+        self.assertEqual(queue._items[0]["status"], "running")
 
     def test_finished_queue_item_is_not_touched(self):
         task_root = self._task("gb-1-slow", race_age=9 * HOUR)
@@ -183,45 +184,42 @@ class CandidateTimeoutTests(GuardTestCase):
         self.assertEqual(self._state(task_root)["status"], "candidates_running")
 
 
-class NoProgressTests(GuardTestCase):
-    def test_quiet_task_is_flagged(self):
-        queue = self._queue(self._task("gb-1-quiet", status="semantic_review_required", quiet=2 * HOUR))
-        self._guard(queue).run_once()
-        flag = queue._items[0]["guardFlag"]
-        self.assertEqual(flag["policy"], "no-progress")
-        self.assertRegex(flag["reason"], r"^1(19|20) 分钟没有任何写入")
-
-    def test_candidate_output_counts_as_progress(self):
-        task_root = self._task("gb-1-busy", quiet=2 * HOUR)
-        stdout = task_root / "monitor" / "runtime" / "candidates" / "candidate-1" / "attempt-01" / "stdout.jsonl"
-        stdout.parent.mkdir(parents=True)
-        stdout.write_text("{}\n", encoding="utf-8")
+class PostTimeoutTests(GuardTestCase):
+    def test_long_review_is_stopped_after_the_post_limit(self):
+        task_root = self._task("gb-2-post", status="semantic_review_required", race_age=6 * HOUR,
+                               race_done=True, post_age=5 * HOUR)
         queue = self._queue(task_root)
-        self._guard(queue).run_once()
+        self._guard(queue, mode="enforce").run_once()
+        item = queue._items[0]
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("评审/录屏阶段超时", item["error"])
+        self.assertEqual(self._state(task_root)["closedPolicy"], "post-timeout")
+
+    def test_within_the_post_limit_is_left_alone(self):
+        task_root = self._task("gb-2-post", status="semantic_review_required", race_age=6 * HOUR,
+                               race_done=True, post_age=3 * HOUR)
+        queue = self._queue(task_root)
+        self._guard(queue, mode="enforce").run_once()
+        self.assertEqual(queue._items[0]["status"], "running")
         self.assertFalse(queue._items[0].get("guardFlag"))
 
-    def test_dependency_churn_is_not_progress(self):
-        task_root = self._task("gb-1-quiet", quiet=2 * HOUR)
-        noise = task_root / "source" / "candidates" / "candidate-1" / "node_modules" / "x.js"
-        noise.parent.mkdir(parents=True)
-        noise.write_text("x", encoding="utf-8")
-        self.assertLess(latest_activity(task_root, []), time.time() - HOUR)
-
-    def test_flag_clears_when_activity_resumes(self):
-        task_root = self._task("gb-1-quiet", quiet=2 * HOUR)
+    def test_post_limit_is_configurable(self):
+        task_root = self._task("gb-2-post", status="semantic_review_required", race_age=6 * HOUR,
+                               race_done=True, post_age=3 * HOUR)
         queue = self._queue(task_root)
-        guard = self._guard(queue)
-        guard.run_once()
-        self.assertTrue(queue._items[0]["guardFlag"])
-        (task_root / "workspace").mkdir(exist_ok=True)
-        (task_root / "workspace" / "gsb.md").write_text("草稿", encoding="utf-8")
-        guard.run_once()
-        self.assertFalse(queue._items[0]["guardFlag"])
-        self.assertEqual(queue.guard_status["flags"], [])
+        self._guard(queue, postPhaseHours=2).run_once()
+        self.assertEqual(queue._items[0]["guardFlag"]["policy"], "post-timeout")
 
-    def test_finished_task_state_is_not_no_progress(self):
-        queue = self._queue(self._task("gb-1-done", status="complete", quiet=5 * HOUR))
-        self._guard(queue).run_once()
+    def test_worker_wait_outlasts_both_phase_limits(self):
+        self.assertEqual(worker_wait_timeout_seconds({}), (6 + 4 + 1) * HOUR)
+        config = {"automation": {"guard": {"candidatePhaseHours": 8, "postPhaseHours": 2}}}
+        self.assertEqual(worker_wait_timeout_seconds(config), 11 * HOUR)
+
+
+class QuietTaskTests(GuardTestCase):
+    def test_quiet_task_is_left_to_the_queue_lease(self):
+        queue = self._queue(self._task("gb-1-quiet", status="semantic_review_required", quiet=2 * HOUR))
+        self._guard(queue, mode="enforce").run_once()
         self.assertFalse(queue._items[0].get("guardFlag"))
 
 
@@ -286,9 +284,10 @@ class GuardModeTests(GuardTestCase):
     def test_settings_default_to_observe_and_are_clamped(self):
         self.assertEqual(guard_settings({})["mode"], "observe")
         clamped = guard_settings({"automation": {"guard": {"mode": "nuke", "candidatePhaseHours": 0.1,
-                                                           "noProgressMinutes": 99999}}})
-        self.assertEqual((clamped["mode"], clamped["candidatePhaseHours"], clamped["noProgressMinutes"]),
+                                                           "leakedProcessMinutes": 99999}}})
+        self.assertEqual((clamped["mode"], clamped["candidatePhaseHours"], clamped["leakedProcessMinutes"]),
                          ("observe", 1, 1440))
+        self.assertNotIn("noProgressMinutes", clamped)
 
     def test_snapshot_carries_the_guard_status(self):
         queue = self._queue(self._task("gb-1-slow", race_age=9 * HOUR))
@@ -312,16 +311,18 @@ class SetGuardActionTests(SchedulerTestCase):
         self.addCleanup(self.service.stop)
 
     def test_mode_and_thresholds_persist(self):
-        snapshot = self.service.automation_action("set-guard", {"mode": "enforce", "noProgressMinutes": 90,
-                                                                "candidatePhaseHours": 7.5})
+        snapshot = self.service.automation_action("set-guard", {"mode": "enforce", "leakedProcessMinutes": 90,
+                                                                "candidatePhaseHours": 7.5, "postPhaseHours": 3})
         self.assertEqual(snapshot["guard"]["mode"], "enforce")
-        self.assertEqual(snapshot["guard"]["noProgressMinutes"], 90)
+        self.assertEqual(snapshot["guard"]["leakedProcessMinutes"], 90)
         saved = json.loads((self.root / "config.json").read_text(encoding="utf-8"))["automation"]["guard"]
-        self.assertEqual((saved["mode"], saved["noProgressMinutes"], saved["candidatePhaseHours"]),
-                         ("enforce", 90, 7.5))
+        self.assertEqual((saved["mode"], saved["leakedProcessMinutes"], saved["candidatePhaseHours"],
+                          saved["postPhaseHours"]), ("enforce", 90, 7.5, 3))
+        self.assertEqual(snapshot["guard"]["postPhaseHours"], 3)
 
     def test_bad_values_are_rejected(self):
-        for payload in ({"mode": "nuke"}, {"noProgressMinutes": 5}, {"candidatePhaseHours": "x"}, {}):
+        for payload in ({"mode": "nuke"}, {"leakedProcessMinutes": 5}, {"candidatePhaseHours": "x"},
+                        {"postPhaseHours": 0.5}, {}):
             with self.assertRaises(MonitorError):
                 self.service.automation_action("set-guard", payload)
 

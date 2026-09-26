@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from api.common import queue_prompt_sha256
-from queue_log import LogWriter, RolloutLogFollower, discover_rollout, log_id_from_result_file, public_log_path
+from queue_log import LogWriter, RolloutLogFollower, discover_rollout, log_id_from_result_file, public_log_path, task_marker
 
 DEFAULT_PUSH_HELPERS = (
     Path.home() / "no_cloud" / "common" / "solo2-monitor" / "CodexQueuePush.app" / "Contents" / "MacOS" / "CodexQueuePush",
@@ -67,7 +67,7 @@ def build_prompt(*, task_name: str, task_root: Path, workdir: Path, workdir_prom
     """
     return (
         "本次监控队列已分配唯一任务名。\n"
-        f"- 唯一任务名：`{task_name}`\n"
+        f"- {task_marker(task_name)}\n"
         f"- 监控台已预留空任务根目录：`{task_root}`\n"
         "- 该任务根目录是唯一允许使用的位置，禁止在 sologsb-harness 或其他目录创建任务。\n"
         "- 初始化时必须显式传入 `--task-root` 指向上面的绝对路径，不得只依赖当前目录。\n\n"

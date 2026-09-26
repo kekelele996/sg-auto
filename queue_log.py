@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -217,12 +217,101 @@ class RolloutLogFollower:
         return written
 
 
+# Rollout events that open and close one agent turn.
+TURN_START_EVENTS = {"task_started"}
+TURN_END_EVENTS = {"task_complete", "turn_aborted"}
+
+
+def task_marker(task_name: str) -> str:
+    """The line ``queue_worker.build_prompt`` puts in the thread's first prompt.
+
+    The bare task name is not enough: a later thread in the same folder sees
+    every sibling task directory in its environment context.
+    """
+    name = str(task_name or "").strip()
+    return f"唯一任务名：`{name}`" if name else ""
+
+
+def sessions_root() -> Path:
+    return Path(os.environ.get("CODEX_SESSIONS_DIR") or Path.home() / ".codex" / "sessions").expanduser()
+
+
 def find_rollout_by_thread(thread_id: str) -> Path | None:
     marker = str(thread_id or "").strip()
     if not marker:
         return None
-    root = Path.home() / ".codex" / "sessions"
-    return next(iter(root.rglob(f"rollout-*-{marker}.jsonl")), None)
+    return next(iter(sessions_root().rglob(f"rollout-*-{marker}.jsonl")), None)
+
+
+def find_rollout(task_name: str, *, since: float | None = None) -> Path | None:
+    """One non-blocking scan for the rollout that mentions ``task_name``.
+
+    Looks in every day directory from ``since`` (local time) up to today, so a
+    thread started before midnight is still found, and skips files last written
+    before ``since``.
+    """
+    marker = task_marker(task_name)
+    if not marker:
+        return None
+    root = sessions_root()
+    today = datetime.now().date()
+    day = datetime.fromtimestamp(since).date() if since else today
+    days = []
+    while day <= today and len(days) < 8:
+        days.append(day)
+        day += timedelta(days=1)
+    for day in reversed(days):
+        base = root / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
+        if not base.is_dir():
+            continue
+        entries = []
+        for path in base.glob("rollout-*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if since is None or mtime >= since:
+                entries.append((mtime, path))
+        for _, path in sorted(entries, reverse=True):
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    head = handle.read(512 * 1024)
+            except OSError:
+                continue
+            if marker in head:
+                return path
+    return None
+
+
+def rollout_turn_open(path: Path, *, tail_bytes: int = 512 * 1024) -> bool:
+    """True while the thread's last turn has started and not yet ended.
+
+    The queue's liveness lease: a desktop agent in the middle of a turn is
+    working on the task, whatever state.json says; once the turn ends (done,
+    stopped or aborted) nothing moves the task until someone sends another
+    message, which writes ``task_started`` and makes this true again.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - tail_bytes))
+            lines = handle.read().splitlines()
+    except OSError:
+        return False
+    for raw in reversed(lines):
+        if b'"event_msg"' not in raw:
+            continue
+        try:
+            event = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue  # the first line of the tail window is usually cut
+        payload = event.get("payload") if isinstance(event, dict) else None
+        kind = str(payload.get("type") or "") if isinstance(payload, dict) else ""
+        if kind in TURN_END_EVENTS:
+            return False
+        if kind in TURN_START_EVENTS:
+            return True
+    return False
 
 
 def discover_rollout(task_name: str, timeout: float = 30.0) -> Path | None:
@@ -232,13 +321,13 @@ def discover_rollout(task_name: str, timeout: float = 30.0) -> Path | None:
     through ``codex_sessions.active_sessions``, which walked the whole session
     tree just to find one file.
     """
-    marker = str(task_name or "").strip()
+    marker = task_marker(task_name)
     if not marker:
         return None
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
         now = datetime.now()
-        base = Path.home() / ".codex" / "sessions" / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}"
+        base = sessions_root() / f"{now:%Y}" / f"{now:%m}" / f"{now:%d}"
         if base.is_dir():
             for path in sorted(base.glob("rollout-*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True):
                 try:

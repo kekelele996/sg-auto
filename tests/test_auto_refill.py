@@ -188,3 +188,119 @@ class ShufflePendingTests(SchedulerTestCase):
         for index in range(10):
             service.queue.add_platform({"code": f"gb-{index}", "name": f"项目 {index}", "variantId": f"v-{index}"})
         self.assertFalse(service.queue.shuffle_pending(random.Random(1), keep_head=10))
+
+
+class PriorityPrefixTests(SchedulerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.config["automation"]["priorityProjects"] = {"enabled": True, "prefixes": ["SoloGSB"]}
+        self.service = SchedulerService(self.config)
+        self.service.settings = SettingsStore(self.root / ".state" / "settings.json")
+        self.addCleanup(self.service.stop)
+
+    def _codes(self):
+        return [item["projectCode"] for item in self.service.queue._items]
+
+    def test_priority_projects_jump_ahead_of_pending_items(self):
+        queue = self.service.queue
+        for code in ["gb-1", "gb-2", "sologsb-1", "gb-3", "sologsb-2"]:
+            queue.add_platform({"code": code, "name": code, "variantId": f"v-{code}"})
+        self.assertEqual(self._codes(), ["sologsb-1", "sologsb-2", "gb-1", "gb-2", "gb-3"])
+
+    def test_priority_projects_stay_ahead_after_a_shuffle(self):
+        queue = self.service.queue
+        for index in range(12):
+            queue.add_platform({"code": f"gb-{index}", "name": "x", "variantId": f"v-{index}"})
+        queue.add_platform({"code": "sologsb-9", "name": "x", "variantId": "v-s"})
+        queue.shuffle_pending(random.Random(3), keep_head=AUTO_REFILL_PREVIEW_SIZE)
+        self.assertEqual(self._codes()[0], "sologsb-9")
+
+    def test_refill_takes_priority_projects_before_the_rest(self):
+        self.config["automation"]["autoRefill"].update({
+            "enabled": True, "targetPending": 2, "batchSize": 2, "taskTypes": ["feature迭代"],
+            "taskTypeWeights": {"feature迭代": 100}, "randomize": True, "shuffleExisting": False,
+        })
+        self.service.platform = _Platform(["gb-1", "gb-2", "gb-3", "sologsb-1", "sologsb-2"])
+        self.service._last_queue_refill_at = 0.0
+        result = self.service.maybe_refill_queue()
+        self.assertEqual(result["added"], 2)
+        self.assertEqual(sorted(self._codes()), ["sologsb-1", "sologsb-2"])
+
+    def test_full_queue_still_takes_priority_projects_only(self):
+        for index in range(3):
+            self.service.queue.add_platform({"code": f"gb-{index}", "name": "x", "variantId": f"v-{index}"})
+        self.config["automation"]["autoRefill"].update({
+            "enabled": True, "targetPending": 3, "batchSize": 10, "taskTypes": ["feature迭代"],
+            "taskTypeWeights": {"feature迭代": 100}, "randomize": False, "shuffleExisting": False,
+        })
+        self.service.platform = _Platform(["gb-7", "gb-8", "sologsb-1", "sologsb-2"])
+        self.service._last_queue_refill_at = 0.0
+        result = self.service.maybe_refill_queue()
+        self.assertEqual(result["added"], 2)
+        self.assertEqual(self._codes(), ["sologsb-1", "sologsb-2", "gb-0", "gb-1", "gb-2"])
+
+    def test_a_finished_priority_project_requeues_behind_waiting_priority_projects(self):
+        queue = self.service.queue
+        for code in ["sologsb-1", "sologsb-2", "sologsb-3", "gb-1"]:
+            queue.add_platform({"code": code, "name": code, "variantId": f"v-{code}"})
+        queue._items[0]["status"] = "done"
+        self.config["automation"]["autoRefill"].update({
+            "enabled": True, "targetPending": 3, "batchSize": 5, "taskTypes": ["feature迭代"],
+            "taskTypeWeights": {"feature迭代": 100}, "randomize": True, "shuffleExisting": True,
+        })
+        self.service.platform = _Platform(["gb-1", "sologsb-1", "sologsb-2", "sologsb-3"])
+        self.service._last_queue_refill_at = 0.0
+        self.assertEqual(self.service.maybe_refill_queue()["added"], 1)
+        pending = [item["projectCode"] for item in queue._items if item["status"] == "pending"]
+        self.assertEqual(pending, ["sologsb-2", "sologsb-3", "sologsb-1", "gb-1"])
+
+    def test_shuffle_keeps_priority_projects_in_queue_order(self):
+        queue = self.service.queue
+        codes = [f"sologsb-{index}" for index in range(14)]
+        for code in [*codes, "gb-1", "gb-2", "gb-3"]:
+            queue.add_platform({"code": code, "name": code, "variantId": f"v-{code}"})
+        for seed in range(5):
+            queue.shuffle_pending(random.Random(seed), keep_head=AUTO_REFILL_PREVIEW_SIZE)
+            self.assertEqual(self._codes()[:14], codes)
+
+    def test_switched_off_the_queue_keeps_its_usual_order(self):
+        self.config["automation"]["priorityProjects"]["enabled"] = False
+        for code in ["gb-1", "sologsb-1"]:
+            self.service.queue.add_platform({"code": code, "name": code, "variantId": f"v-{code}"})
+        self.assertEqual(self._codes(), ["gb-1", "sologsb-1"])
+
+
+class PriorityProjectsActionTests(SchedulerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.service = SchedulerService(self.config)
+        self.service.settings = SettingsStore(self.root / ".state" / "settings.json")
+        self.addCleanup(self.service.stop)
+
+    def _saved(self):
+        return json.loads((self.root / "config.json").read_text(encoding="utf-8"))["automation"]["priorityProjects"]
+
+    def test_off_by_default(self):
+        self.assertEqual(self.service.queue.fast_snapshot()["priorityProjects"], {"enabled": False, "prefixes": []})
+
+    def test_saving_prefixes_and_switching_on_reorders_the_queue(self):
+        for code in ["gb-1", "sologsb-1", "abc-1"]:
+            self.service.queue.add_platform({"code": code, "name": code, "variantId": f"v-{code}"})
+        self.service._last_queue_refill_at = time.time()
+        snapshot = self.service.automation_action(
+            "set-priority-projects", {"enabled": True, "prefixes": "sologsb， ABC, sologsb"})
+        self.assertEqual(snapshot["priorityProjects"], {"enabled": True, "prefixes": ["sologsb", "ABC"]})
+        self.assertEqual(self._saved(), {"enabled": True, "prefixes": ["sologsb", "ABC"]})
+        self.assertEqual([item["projectCode"] for item in self.service.queue._items], ["sologsb-1", "abc-1", "gb-1"])
+        self.assertEqual(self.service._last_queue_refill_at, 0.0)
+
+    def test_switching_on_without_a_prefix_is_refused(self):
+        from api.common import MonitorError
+
+        with self.assertRaises(MonitorError):
+            self.service.automation_action("set-priority-projects", {"enabled": True})
+
+    def test_clearing_the_prefixes_switches_it_off(self):
+        self.service.automation_action("set-priority-projects", {"enabled": True, "prefixes": ["sologsb"]})
+        snapshot = self.service.automation_action("set-priority-projects", {"prefixes": ""})
+        self.assertEqual(snapshot["priorityProjects"], {"enabled": False, "prefixes": []})

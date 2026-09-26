@@ -36,6 +36,8 @@ from .common import (
     ManagerApiError,
     MonitorError,
     discover_manager_base_urls,
+    is_priority_project,
+    priority_project_prefixes,
     keychain_read,
     keychain_write,
     manager_request_json,
@@ -411,7 +413,12 @@ class PlatformProvider:
                 if str(item.get("code") or "").casefold() in blocked:
                     excluded.append({"code": str(item.get("code") or ""), "reason": "已被手动禁用"})
             items = [item for item in items if str(item.get("code") or "").casefold() not in blocked]
-        items.sort(key=lambda item: (str(item.get("code") or ""), str(item.get("name") or "")))
+        prefixes = priority_project_prefixes(self.config)
+        items.sort(key=lambda item: (
+            not is_priority_project(item.get("code"), prefixes),
+            str(item.get("code") or ""),
+            str(item.get("name") or ""),
+        ))
         result = {
             "items": items,
             "total": len(items),

@@ -145,14 +145,10 @@
   /* ------------------------------------------------------------------- rail */
   function renderRail(state) {
     const queue = state.queue || {};
-    const mode = queue.scheduleMode || "containers";
     const badge = $("#modeBadge");
-    if (badge) {
-      setAttr(badge, "data-mode", mode);
-      setHtml(badge, `<span class="dot"></span>${mode === "containers" ? "容器优先" : "任务数量优先"}`);
-      setAttr(badge, "title", mode === "containers"
-        ? "保持运行中的候选容器数等于设定值；点击切换"
-        : "保持并行任务数等于设定值；点击切换");
+    if (badge && queue.maxTasks) {
+      setHtml(badge, `<span class="dot"></span>任务 ${queue.maxTasks} · 容器 ${queue.maxContainers}`);
+      setAttr(badge, "title", "同时运行的任务数上限 · 候选容器上限（技能按先来先得排队）；在队列页「调度上限」修改");
     }
     const folder = $("#folderSelect");
     if (folder) {
@@ -221,11 +217,10 @@
     const excluded = Number(containers.excluded ?? 0);
     const limit = Number(containers.hardLimit ?? 0);
     const queued = Number(containers.reserved ?? 0);
-    const phantom = (containers.phantom || []).length;
     const cells = [
       {
         k: "运行中任务", v: summary.active || 0, tone: "run",
-        s: `并发上限 ${(queue.scheduleMode === "containers" ? queue.maxActiveTasks : queue.maxTasks) || queue.capacity || 0} · 队列占用 ${counts.running || 0}`,
+        s: `并发上限 ${queue.maxTasks || queue.capacity || 0} · 队列占用 ${counts.running || 0}`,
       },
       {
         k: "运行容器", v: running, unit: limit ? `/ ${limit}` : "", tone: "run",
@@ -234,7 +229,6 @@
           excluded ? `免计 ${excluded}` : "",
           Number(containers.foreign || 0) ? `外部 ${Number(containers.foreign)}` : "",
           Number(containers.others || 0) ? `验证等 ${Number(containers.others)} 不计` : "",
-          phantom ? `忽略失联 ${phantom}` : "",
           containers.stale ? staleLine(containers) : "",
         ].filter(Boolean).join(" · "),
         meter: limit ? Math.min(100, Math.round((running / limit) * 100)) : null,

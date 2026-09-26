@@ -1,15 +1,16 @@
 """Fallback policies for tasks that will not finish on their own.
 
-Three policies, checked once per reconcile round:
+Three policies, checked once per reconcile round (a task that merely went quiet
+is the queue's task lease's business, see QueueManager._task_lease):
 
 ``candidate-timeout``
     The candidate race of a queue-owned task has been running longer than
     ``candidatePhaseHours`` (default 6 h; the slowest healthy race so far took
     5.5 h).
-``no-progress``
-    A queue-owned task that is not finished has written nothing — state file,
-    candidate stdout, trajectories, workspace, the worker's log — for
-    ``noProgressMinutes`` (default 60).
+``post-timeout``
+    Review, recording and submission after the race have been running longer
+    than ``postPhaseHours`` (default 4 h; 95% of healthy tasks of 09-25/26
+    finished them within 4 h, 82% within 2 h).
 ``leaked-process``
     Processes are still running under a task directory that finished
     (``complete`` / ``failed`` / ``blocked`` / ``error`` / ``stopped``) more than
@@ -49,7 +50,7 @@ from .common import (
 GUARD_MODES = ("off", "observe", "enforce")
 DEFAULT_GUARD_MODE = "observe"
 DEFAULT_CANDIDATE_PHASE_HOURS = 6.0
-DEFAULT_NO_PROGRESS_MINUTES = 60
+DEFAULT_POST_PHASE_HOURS = 4.0
 DEFAULT_LEAKED_PROCESS_MINUTES = 60
 FINISHED_TASK_STATUSES = {"complete", "stopped", *TASK_FAILURE_STATUSES}
 SKILL_STOP_TASKS_PATH = Path(os.environ.get(
@@ -60,12 +61,9 @@ SKILL_STOP_TASKS_PATH = Path(os.environ.get(
 # the queue worker, which exits by itself once the state file is terminal.
 SPARED_EXECUTABLES = {"login", "zsh", "bash", "sh", "fish", "tmux", "screen", "-zsh", "-bash"}
 SPARED_MARKERS = ("queue_worker.py",)
-# Directories the activity scan does not descend into: dependency trees and
-# verify clones change for reasons unrelated to the task making progress.
-SKIPPED_DIRS = {"node_modules", ".git", "verify", "__pycache__", ".venv", "dist", "build"}
 POLICY_LABELS = {
     "candidate-timeout": "候选阶段超时",
-    "no-progress": "长时间无进展",
+    "post-timeout": "评审/录屏阶段超时",
     "leaked-process": "残留进程",
 }
 
@@ -84,9 +82,19 @@ def guard_settings(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "mode": mode if mode in GUARD_MODES else DEFAULT_GUARD_MODE,
         "candidatePhaseHours": number("candidatePhaseHours", DEFAULT_CANDIDATE_PHASE_HOURS, 1, 48),
-        "noProgressMinutes": int(number("noProgressMinutes", DEFAULT_NO_PROGRESS_MINUTES, 15, 1440)),
+        "postPhaseHours": number("postPhaseHours", DEFAULT_POST_PHASE_HOURS, 1, 48),
         "leakedProcessMinutes": int(number("leakedProcessMinutes", DEFAULT_LEAKED_PROCESS_MINUTES, 10, 1440)),
     }
+
+
+def worker_wait_timeout_seconds(config: dict[str, Any]) -> int:
+    """How long a queue worker waits for its task: past both phase limits.
+
+    The guard stops a task at its phase limit; this is only the backstop for
+    a worker whose task never reached the guard (guard off, no state.json).
+    """
+    settings = guard_settings(config)
+    return int((settings["candidatePhaseHours"] + settings["postPhaseHours"] + 1) * 3600)
 
 
 def list_processes() -> list[dict[str, Any]]:
@@ -149,40 +157,8 @@ def terminate(process: dict[str, Any]) -> bool:
     return True
 
 
-def latest_activity(task_root: Path, extra: list[Path], *, newer_than: float = 0.0) -> float | None:
-    """Newest mtime among the files a working task writes.
-
-    Stops early once something newer than ``newer_than`` turns up, so a busy
-    task costs a handful of ``stat`` calls.
-    """
-    latest: float | None = None
-
-    def seen(path: Path) -> bool:
-        nonlocal latest
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return False
-        latest = mtime if latest is None else max(latest, mtime)
-        return bool(newer_than) and mtime >= newer_than
-
-    for path in [task_root / "monitor" / "state.json", *extra]:
-        if str(path) not in {"", "."} and seen(path):
-            return latest
-    for top in ("monitor", "workspace", "source"):
-        base = task_root / top
-        if not base.is_dir():
-            continue
-        for current, dirs, files in os.walk(base):
-            dirs[:] = [name for name in dirs if name not in SKIPPED_DIRS]
-            for name in files:
-                if seen(Path(current) / name):
-                    return latest
-    return latest
-
-
 class TaskGuard:
-    """Checks the three policies; acts only in ``enforce`` mode."""
+    """Checks the two policies; acts only in ``enforce`` mode."""
 
     def __init__(
         self,
@@ -243,17 +219,12 @@ class TaskGuard:
             hours = (now - race_started.timestamp()) / 3600
             return {"policy": "candidate-timeout", "taskRoot": str(task_root),
                     "reason": f"候选阶段已运行 {hours:.1f} 小时，超过上限 {settings['candidatePhaseHours']:g} 小时"}
-        quiet_limit = settings["noProgressMinutes"] * 60
-        # The worker's log grows while the desktop agent's rollout does.
-        extra = [Path(str(item.get("resultFile") or ""))]
-        job = self.queue.jobs.get_platform(str(item.get("id") or ""), str(item.get("runKey") or ""))
-        if job and job.get("logPath"):
-            extra.append(Path(str(job["logPath"])))
-        latest = latest_activity(task_root, extra, newer_than=now - quiet_limit)
-        if latest is not None and now - latest >= quiet_limit:
-            return {"policy": "no-progress", "taskRoot": str(task_root),
-                    "reason": f"{int((now - latest) / 60)} 分钟没有任何写入（状态、候选输出、轨迹、日志），"
-                              f"超过上限 {settings['noProgressMinutes']} 分钟"}
+        race_finished = parse_time(state.get("candidateRaceFinishedAt"))
+        limit = settings["postPhaseHours"] * 3600
+        if race_finished and now - race_finished.timestamp() >= limit:
+            hours = (now - race_finished.timestamp()) / 3600
+            return {"policy": "post-timeout", "taskRoot": str(task_root),
+                    "reason": f"评审/录屏/提交已运行 {hours:.1f} 小时，超过上限 {settings['postPhaseHours']:g} 小时"}
         return None
 
     def _leaks(self, settings: dict[str, Any], now: float, processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -382,7 +353,6 @@ class TaskGuard:
         item.update({
             "status": "failed",
             "capacityHeld": False,
-            "orphaned": False,
             "slotMarkers": [],
             "finishedAt": utc_now(),
             "error": f"兜底终止（{label}）：{reason}",
